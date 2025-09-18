@@ -1,0 +1,49 @@
+body{font-family:Arial;background:#faf2e7;margin:1em 5%}
+.flash.success{color:green}
+/* Upload Modal Styles */
+#uploadModal .modal-body {
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+#uploadProgressModal .progress {
+    height: 25px;
+}
+
+#uploadProgressModal .progress-bar {
+    font-size: 14px;
+    line-height: 25px;
+}
+
+.video-controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 20px;
+}
+
+.video-controls button,
+.video-controls a {
+    min-width: 150px;
+}
+
+/* Platform-specific styling */
+.platform-youtube {
+    background-color: #ff0000;
+    color: white;
+}
+
+.platform-facebook {
+    background-color: #1877f2;
+    color: white;
+}
+
+.platform-instagram {
+    background: linear-gradient(45deg, #f58529, #dd2a7b, #8134af);
+    color: white;
+}
+
+.platform-tiktok {
+    background-color: #000000;
+    color: white;
+}

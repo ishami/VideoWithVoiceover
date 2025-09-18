@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# run.sh – start the VideoWithVoiceover Flask app
+#          call  ./run.sh prod   → Gunicorn (multi-worker production)
+#          call  ./run.sh        → Flask dev server
+#
+
+# ─── 0) Noise-free head-less Qt ──────────────────────────────────────────
+export QT_LOGGING_RULES="*.warning=false;qt.qpa.*=false"
+
+# ─── 0b) 3rd-party API keys (keep yours here) ────────────────────────────
+export OPENAI_API_KEY="sk-proj-rjJGSlP9rRzc4jNMpt0BT3BlbkFJLMLQHqpdBOaoSow6zM7d"
+export PIXABAY_API_KEY="44812949-ba98a63acdbb20b31f0281193"
+export PEXELS_API_KEY="e4agaHhuOEpih3K562pmje6YJiy2jSQ37bYJU1nm5nw6NmeualG8afvG"
+export UNSPLASH_API_KEY="ATMcaMHzCfB789pGt8m6L5Z3YyvdgndRqiBNaxwmbf8"
+
+# ─── 0c) YouTube OAuth2 / Google Cloud config ────────────────────────────
+export YOUTUBE_REDIRECT_URI="https://studio.ai-videocreator.com/oauth2callback"
+
+# ─── 0d) Alternative service tokens (optional) ────────────────────────────
+# export HUGGING_FACE_TOKEN="your-huggingface-token-here"
+
+# ─── 0e) Monitoring and fallback settings ──────────────────────────────────
+export ENABLE_API_MONITORING="true"
+export API_RETRY_ATTEMPTS="3"
+export API_RETRY_DELAY="2"
+
+# Add to your ~/.bashrc or ~/.profile:
+export HUGGING_FACE_TOKEN="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"
+export STRIPE_SECRET_KEY="sk_test_51RyjXz3d5aUJQk1CVS3ABwQd5D1hnYdr7t3D87z4UmK8LsbvJBm5730vhejiPN5rqtD5s0bhbXSEERB3TAiJfXU600jzKT18QZ"
+export STRIPE_PUBLISHABLE_KEY="pk_test_51RyjXz3d5aUJQk1CGyuqnNLBFP87R2dmtQmIeNTdQjlKbB5QFKRIqsSojFa6mq434ycCRb4tag9efm5CMnGyp8y700Ri8zevKT"
+export STRIPE_SUBSCRIPTION_PRICE_ID="price_1Ryjfh3d5aUJQk1CZaoR4Ef4"        # from your Stripe dashboard
+export STRIPE_ONE_TIME_PRICE_ID="price_1RyjdO3d5aUJQk1CmrFNSup6"
+
+export STRIPE_WEBHOOK_SECRET="we_1Ryjmw3d5aUJQk1CwpdRInJO"  # from your Stripe webhook settings
+
+# If your client secrets are not at the default path, set:
+# export GOOGLE_CLIENT_SECRETS="/absolute/path/to/your/client_secrets.json"
+# export GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+# export GOOGLE_CLIENT_SECRET="your-client-secret"
+# export YOUTUBE_SCOPES="https://www.googleapis.com/auth/youtube.upload ..."
+
+# ─── 1) Basic script options ─────────────────────────────────────────────
+set -euo pipefail
+PORT=${PORT:-8000}          # honour $PORT or default to 8000
+MODE=${1:-dev}              # first CLI arg, defaults to "dev"
+
+echo "» Starting VideoWithVoiceover on port $PORT  (mode: $MODE)"
+
+# ─── 1b) Create necessary directories ────────────────────────────────────
+echo "• Creating necessary directories..."
+mkdir -p logs
+mkdir -p utils
+mkdir -p static/audio/fallbacks
+mkdir -p static/images/fallbacks
+mkdir -p static/videos
+mkdir -p workspace
+
+# ─── 2) Free the port if something else is listening ─────────────────────
+pids=$(lsof -ti tcp:"$PORT" || true)
+if [[ -n "$pids" ]]; then
+  echo "• Port $PORT is in use by: $pids – stopping …"
+  kill -TERM $pids || true
+  sleep 1
+fi
+
+# ─── 3) Activate virtual-env (adjust the path if yours is different) ─────
+if [[ -f "venv/bin/activate" ]]; then
+  # shellcheck source=/dev/null
+  source venv/bin/activate
+  echo "• Activated virtual environment"
+  pip install -r requirements.txt
+else
+  # Create virtual environment if it doesn't exist
+  echo "• Creating virtual environment..."
+  python3 -m venv venv
+  source venv/bin/activate
+  echo "• Activated new virtual environment"
+  pip install -r requirements.txt
+fi
+
+# ─── 3b) Install additional dependencies if needed ──────────────────────
+echo "• Checking for additional dependencies..."
+
+# Check if gTTS is installed (for fallback TTS)
+if ! python -c "import gtts" 2>/dev/null; then
+  echo "• Installing gTTS for TTS fallback..."
+  pip install gtts --break-system-packages || pip install gtts
+fi
+
+# Check if Pillow is installed (for image fallbacks)
+if ! python -c "import PIL" 2>/dev/null; then
+  echo "• Installing Pillow for image fallbacks..."
+  pip install Pillow --break-system-packages || pip install Pillow
+fi
+
+# Check if requests is installed (for API fallbacks)
+if ! python -c "import requests" 2>/dev/null; then
+  echo "• Installing requests for API fallbacks..."
+  pip install requests --break-system-packages || pip install requests
+fi
+
+# ─── 3c) Initialize monitoring system ───────────────────────────────────
+echo "• Initializing API monitoring system..."
+python -c "
+import sys
+sys.path.append('.')
+try:
+    from utils.monitoring import api_monitor
+    from utils.alternative_services import AlternativeServices
+
+    # Test monitoring system
+    api_monitor.log_api_call('system', 'startup', True)
+    print('✓ Monitoring system initialized')
+
+    # Test alternative services
+    alt_services = AlternativeServices()
+    availability = alt_services.check_service_availability()
+    print('✓ Alternative services checked:', availability)
+
+except Exception as e:
+    print('⚠ Warning: Monitoring system initialization failed:', e)
+    print('  The app will still work, but without advanced error handling')
+"
+
+# ─── 4) Start the server ─────────────────────────────────────────────────
+if [[ "$MODE" == "prod" ]]; then
+  echo "• Launching Gunicorn (4 workers, pre-forked)"
+  echo "• Monitoring enabled: $ENABLE_API_MONITORING"
+  echo "• Retry attempts: $API_RETRY_ATTEMPTS"
+  exec gunicorn --timeout 300 -w 4 -b 0.0.0.0:"$PORT" app:app
+else
+  echo "• Launching Flask dev server (single process, auto-reload)"
+  echo "• Monitoring enabled: $ENABLE_API_MONITORING"
+  echo "• API status endpoint: http://localhost:$PORT/api-status"
+  echo "• Usage stats endpoint: http://localhost:$PORT/api/usage-stats"
+  # If your app.py already calls app.run(host='0.0.0.0', port=PORT)
+  # plain "python app.py" is enough; otherwise uncomment flask run line:
+  #
+  # FLASK_APP=app.py FLASK_ENV=development exec flask run --host=0.0.0.0 --port="$PORT"
+  #
+  exec python app.py
+fi

@@ -1,0 +1,2230 @@
+#!/usr/bin/env python3
+"""
+engine.py – complete helper module for "Video with Voice-over"
+==============================================================
+• Triple-list manifest (media_clips | music_clips | subtitles)
+• Robust path handling and duration helpers
+• Script generation, SEO, voice test
+• Provider search + download for images / videos / music
+• Threaded regeneration that clears old data immediately
+• User-specific workspace support
+"""
+
+from __future__ import annotations
+import asyncio, datetime, json, os, re, shutil, subprocess, tempfile, threading
+from collections import Counter
+from functools   import lru_cache
+from pathlib     import Path
+from typing      import Any, Optional, Tuple
+from urllib.parse import urlparse
+from werkzeug.datastructures import FileStorage
+import threading
+import datetime
+
+processing_locks = {}  # Track active processing per project
+
+# ──────────────────────  paths / globals  ──────────────────────
+# Remove global WORK_DIR and FINAL_DIR - use functions instead
+UPLOAD_ROOT   = Path("uploads");   UPLOAD_ROOT.mkdir(exist_ok=True)
+
+# File names within workspace
+SCRIPT_FILE_NAME = "script.txt"
+CLIPS_JSON_NAME = "clips.json"
+KEYWORDS_FILE_NAME = "keywords.txt"
+SELECTED_GENRE_FILE_NAME = "selected_genre.txt"
+LAST_VOICE_FILE_NAME = "last_voice.txt"
+PLATFORM_FILE_NAME = "selected_platform.txt"
+
+def get_user_workspace_path(user_id: int, project_id: int) -> Path:
+    """Get or create user-specific workspace directory"""
+    base_path = Path('/home/myapp/apps/VideoWithVoiceover/workspace')
+    user_dir = base_path / f"user_{user_id}" / f"project_{project_id}"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return user_dir
+
+def get_workspace_file(user_id: int, project_id: int, filename: str) -> Path:
+    """Get path to a specific file in user's workspace"""
+    workspace = get_user_workspace_path(user_id, project_id)
+    return workspace / filename
+
+def get_final_dir(user_id: int, project_id: int) -> Path:
+    """Get final directory for user's project"""
+    workspace = get_user_workspace_path(user_id, project_id)
+    final_dir = workspace / "final"
+    final_dir.mkdir(exist_ok=True)
+    return final_dir
+
+# Legacy support - create default workspace for backward compatibility
+def _get_legacy_workspace() -> Path:
+    """Get legacy workspace for backward compatibility"""
+    workspace = Path("workspace")
+    workspace.mkdir(exist_ok=True)
+    return workspace
+
+_LOCK = threading.Lock()
+
+# ───── static UI meta (used by templates) ──────────────────────
+language_options = [
+    {"label": "English    (Default)", "code": "en", "flag": "us.png"},
+    {"label": "Arabic     العربية", "code": "ar", "flag": "sa.png"},
+    {"label": "Spanish    Español", "code": "es", "flag": "es.png"},
+    {"label": "French     Français", "code": "fr", "flag": "fr.png"},
+    {"label": "German     Deutsch", "code": "de", "flag": "de.png"},
+    {"label": "Portuguese Português", "code": "pt", "flag": "pt.png"},
+    {"label": "Russian    Русский", "code": "ru", "flag": "ru.png"},
+    {"label": "Chinese    中文", "code": "zh", "flag": "cn.png"},
+    {"label": "Japanese   日本語", "code": "ja", "flag": "jp.png"},
+    {"label": "Hindi      हिन्दी", "code": "hi", "flag": "in.png"},
+    {"label": "Korean     한국어", "code": "ko", "flag": "kr.png"},
+    {"label": "Turkish    Türkçe", "code": "tr", "flag": "tr.png"},
+    {"label": "Urdu       اردو", "code": "ur", "flag": "pk.png"},
+    {"label": "Persian    فارسی", "code": "fa", "flag": "ir.png"}
+]
+SUPPORTED_TICKET_TYPES = ["Issue", "Enhancement", "Comment"]
+
+# Define output settings for different platforms
+output_settings = {
+    'youtube': {'codec': 'libx264', 'resolution': (1920, 1080), 'fps': 24},
+    'youtube_shorts': {'codec': 'libx264', 'resolution': (1080, 1920), 'fps': 30},
+    'tiktok': {'codec': 'libx264', 'resolution': (1080, 1920), 'fps': 30},
+    'facebook': {'codec': 'libx264', 'resolution': (1920, 1080), 'fps': 24},
+    'instagram': {'codec': 'libx264', 'resolution': (1080, 1920), 'fps': 30},
+    '720p': {'codec': 'libx264', 'resolution': (1280, 720), 'fps': 24}
+}
+
+# Landscape-oriented platforms
+LANDSCAPE_PLATFORMS = ['youtube', 'facebook', '720p']
+# Portrait-oriented platforms
+PORTRAIT_PLATFORMS = ['youtube_shorts', 'tiktok', 'instagram']
+
+# ───── optional third-party libs (silent fallback) ─────────────
+try:
+    from moviepy.editor import VideoFileClip, AudioFileClip
+    _moviepy = True
+except Exception:
+    _moviepy = False
+try:
+    from mutagen import File as MutagenFile
+    _mutagen = True
+except Exception:
+    _mutagen = False
+try:
+    import edge_tts
+    from edge_tts import Communicate
+    _edge = True
+except Exception:
+    _edge = False
+try:
+    from gtts import gTTS
+    _gtts = True
+except Exception:
+    _gtts = False
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI()
+    _openai = True
+except Exception:
+    _openai = False
+try:
+    import requests
+except Exception:
+    requests = None
+
+PIXABAY_API_KEY  = os.getenv("PIXABAY_API_KEY",  "") or "44812949-ba98a63acdbb20b31f0281193"
+PEXELS_API_KEY   = os.getenv("PEXELS_API_KEY",   "") or "e4agaHhuOEpih3K562pmje6YJiy2jSQ37bYJU1nm5nw6NmeualG8afvG"
+UNSPLASH_API_KEY = os.getenv("UNSPLASH_API_KEY", "") or "ATMcaMHzCfB789pGt8m6L5Z3YyvdgndRqiBNaxwmbf8"
+
+DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
+_TEST_PHRASE_EN = "Hello! This is a sample of the selected voice."
+
+# ──────────────────────  voice test helper  ──────────────────────
+def generate_voice_test(voice: str) -> bytes:
+    """
+    Generate a short audio sample using the specified voice.
+    Returns binary MP3 data.
+    """
+    if not _edge:
+        return b""
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp:
+        temp_path = Path(temp.name)
+
+    try:
+        text = _TEST_PHRASE_EN
+        asyncio.run(Communicate(text=text, voice=voice).save(str(temp_path)))
+        audio_data = temp_path.read_bytes()
+        temp_path.unlink(missing_ok=True)
+        return audio_data
+    except Exception as exc:
+        print(f"[engine] Voice test generation failed: {exc}")
+        temp_path.unlink(missing_ok=True)
+        return b""
+
+# ──────────────────────  uploads helper  ──────────────────────
+def _to_uploads(src: str | Path) -> str:
+    """Return path relative to uploads/, copying once if necessary."""
+    p = Path(src).expanduser().resolve()
+    root = UPLOAD_ROOT.resolve()
+
+    if not p.exists():
+        print(f"[engine] WARN  missing file {p}")
+        return ""
+
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        pass
+
+    today = datetime.date.today().isoformat()
+    dst   = root / today / p.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if p.samefile(dst):
+            return str(dst.relative_to(root))
+    except Exception:
+        pass
+
+    try:
+        shutil.copy2(p, dst)
+        return str(dst.relative_to(root))
+    except Exception as exc:
+        print(f"[engine] copy2({p} → {dst}) failed: {exc}")
+        return ""
+
+# ──────────────────────  duration helpers  ────────────────────
+_VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+
+@lru_cache(maxsize=256)
+def _video_duration(path: str) -> float:
+    if _moviepy:
+        try:
+            with VideoFileClip(path) as c:
+                return float(c.duration or 0.0)
+        except Exception:
+            pass
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stderr=subprocess.DEVNULL, text=True)
+        return float(out.strip())
+    except Exception:
+        return 0.0
+
+
+@lru_cache(maxsize=256)
+def _audio_duration(path: str) -> float:
+    if _moviepy:
+        try:
+            with AudioFileClip(path) as c:
+                return float(c.duration or 0.0)
+        except Exception:
+            pass
+    if _mutagen:
+        try:
+            mf = MutagenFile(path)
+            return float(mf.info.length or 0.0)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _media_info(path: str) -> tuple[str, float]:
+    if not path:
+        return "", 0.0
+    return ("Video", _video_duration(path)) \
+        if path.lower().endswith(_VIDEO_EXTS) else ("Image", 5.0)
+
+
+# ──────────────────────  provider search helpers  ─────────────
+def _search_pixabay_images(q: str) -> list[str]:
+    print(f"[DEBUG] _search_pixabay_images called with query: {q}, API_KEY present: {bool(PIXABAY_API_KEY)}")
+    print(f"[DEBUG] _search_pixabay_images called with q={q}, API_KEY={PIXABAY_API_KEY[:8] if PIXABAY_API_KEY else 'NONE'}..., requests={requests}")
+    if not (requests and PIXABAY_API_KEY): return []
+    try:
+        r = requests.get("https://pixabay.com/api/",
+                         params={"key": PIXABAY_API_KEY,
+                                 "q": q, "image_type": "photo", "per_page": 6})
+        data = r.json()
+        print(f"[DEBUG] Pixabay response: status={r.status_code}, total={data.get('total', 0)}, hits={len(data.get('hits', []))}")
+        urls = [h["largeImageURL"] for h in data.get("hits", [])]
+        print(f"[DEBUG] Pixabay returning {len(urls)} URLs")
+        return urls
+    except Exception as e:
+        print(f"[ERROR] _search_pixabay_images failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def _search_pixabay_videos(q: str) -> list[str]:
+    if not (requests and PIXABAY_API_KEY): return []
+    r = requests.get("https://pixabay.com/api/videos/",
+                     params={"key": PIXABAY_API_KEY,
+                             "q": q, "per_page": 6})
+    out = []
+    for hit in r.json().get("hits", []):
+        out += [v["url"] for v in hit.get("videos", {}).values()]
+    return out
+
+
+def _search_pexels_images(q: str) -> list[str]:
+    print(f"[DEBUG] _search_pexels_images called with query: {q}, API_KEY present: {bool(PEXELS_API_KEY)}")
+    print(f"[DEBUG] _search_pexels_images called with q={q}, API_KEY={PEXELS_API_KEY[:8] if PEXELS_API_KEY else 'NONE'}..., requests={requests}")
+    if not (requests and PEXELS_API_KEY): return []
+    try:
+        r = requests.get("https://api.pexels.com/v1/search",
+                         headers={"Authorization": PEXELS_API_KEY},
+                         params={"query": q, "per_page": 6})
+        data = r.json()
+        print(f"[DEBUG] Pexels response: status={r.status_code}, total={data.get('total_results', 0)}, photos={len(data.get('photos', []))}")
+        urls = [p["src"]["original"] for p in data.get("photos", [])]
+        print(f"[DEBUG] Pexels returning {len(urls)} URLs")
+        return urls
+    except Exception as e:
+        print(f"[ERROR] _search_pexels_images failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def _search_pexels_videos(q: str) -> list[str]:
+    if not (requests and PEXELS_API_KEY): return []
+    r = requests.get("https://api.pexels.com/videos/search",
+                     headers={"Authorization": PEXELS_API_KEY},
+                     params={"query": q, "per_page": 6})
+    links = []
+    for vid in r.json().get("videos", []):
+        best = min(vid.get("video_files", []),
+                   key=lambda f: abs((f.get("width", 0) - 1280)), default=None)
+        if best: links.append(best["link"])
+    return links
+
+
+def _search_unsplash(q: str) -> list[str]:
+    print(f"[DEBUG] _search_unsplash called with query: {q}, API_KEY present: {bool(UNSPLASH_API_KEY)}")
+    print(f"[DEBUG] _search_unsplash called with q={q}, API_KEY={UNSPLASH_API_KEY[:8] if UNSPLASH_API_KEY else 'NONE'}..., requests={requests}")
+    if not (requests and UNSPLASH_API_KEY): return []
+    try:
+        r = requests.get("https://api.unsplash.com/search/photos",
+                         headers={"Authorization": f"Client-ID {UNSPLASH_API_KEY}"},
+                         params={"query": q, "per_page": 6})
+        data = r.json()
+        print(f"[DEBUG] Unsplash response: status={r.status_code}, total={data.get('total', 0)}, results={len(data.get('results', []))}")
+        urls = [p["urls"]["regular"] for p in data.get("results", [])]
+        print(f"[DEBUG] Unsplash returning {len(urls)} URLs")
+        return urls
+    except Exception as e:
+        print(f"[ERROR] _search_unsplash failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def _search_jamendo_music(q: str) -> list[str]:
+    if not requests: return []
+    r = requests.get("https://api.jamendo.com/v3.0/tracks/",
+                     params={"client_id": "c2b0a654", "format": "json",
+                             "limit": 6, "search": q, "include": "musicinfo"})
+    return [t["audio"] for t in r.json().get("results", [])]
+
+
+def _download_url_with_extension(url: str, folder: Path, expected_type: str = 'auto',
+                                 base_name: str = None) -> Path | None:
+    """Download file with proper extension detection"""
+    print(f"[DEBUG] _download_url_with_extension called:")
+    print(f"  - URL: {url}")
+    print(f"  - Folder: {folder}")
+    print(f"  - Requests module: {requests}")
+    if not (requests and url):
+        return None
+
+    folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        with requests.get(url, stream=True, timeout=30, headers=headers) as r:
+            r.raise_for_status()
+
+            content_type = r.headers.get('content-type', '').split(';')[0].strip()
+            print(f"[download] {url} - Content-Type: {content_type}")
+
+            proper_extension = _determine_extension(url, content_type, expected_type)
+
+            if base_name:
+                name = base_name
+            else:
+                name = os.path.basename(urlparse(url).path) or f"{hash(url)}"
+
+            name_without_ext = os.path.splitext(name)[0]
+            final_name = name_without_ext + proper_extension
+
+            out = folder / final_name
+
+            if out.exists():
+                print(f"[download] File already exists: {out}")
+                return out
+
+            with out.open("wb") as fh:
+                for chunk in r.iter_content(8192):
+                    fh.write(chunk)
+
+            print(f"[download] Downloaded: {out} (extension: {proper_extension})")
+            return out
+
+    except Exception as exc:
+        print(f"[download] {url} – {exc}")
+        return None
+
+
+def _determine_extension(url: str, content_type: str, expected_type: str) -> str:
+    """Determine the proper file extension"""
+    if content_type:
+        if content_type.startswith('audio/'):
+            if 'mp3' in content_type or 'mpeg' in content_type:
+                return '.mp3'
+            elif 'wav' in content_type:
+                return '.wav'
+            elif 'ogg' in content_type:
+                return '.ogg'
+            else:
+                return '.mp3'
+
+        elif content_type.startswith('video/'):
+            if 'mp4' in content_type:
+                return '.mp4'
+            elif 'webm' in content_type:
+                return '.webm'
+            else:
+                return '.mp4'
+
+        elif content_type.startswith('image/'):
+            if 'jpeg' in content_type or 'jpg' in content_type:
+                return '.jpg'
+            elif 'png' in content_type:
+                return '.png'
+            else:
+                return '.jpg'
+
+    parsed_url = urlparse(url)
+    url_path = parsed_url.path.lower()
+    if '.' in url_path:
+        url_ext = os.path.splitext(url_path)[1]
+        valid_extensions = ['.mp3', '.wav', '.ogg', '.mp4', '.avi', '.mov', '.jpg', '.jpeg', '.png', '.gif']
+        if url_ext in valid_extensions:
+            return url_ext
+
+    if expected_type == 'music' or expected_type == 'audio':
+        return '.mp3'
+    elif expected_type == 'media' or expected_type == 'video':
+        return '.mp4'
+    else:
+        return '.jpg'
+
+
+def _download_url(url: str, folder: Path) -> Path | None:
+    """Original download function - now calls enhanced version"""
+    return _download_url_with_extension(url, folder, 'auto')
+
+import asyncio
+
+async def _download_all(urls: list[str], folder: Path) -> list[Path]:
+    """
+    Download all URLs concurrently using existing _download_url.
+    Final log runs only after all are finished.
+    """
+    tasks = [asyncio.to_thread(_download_url, url, folder) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    downloaded = []
+    for url, res in zip(urls, results):
+        if isinstance(res, Exception):
+            print(f"[ERROR] Download failed for {url}: {res}")
+        elif res is None:
+            print(f"[WARN] Download returned None for {url}")
+        else:
+            downloaded.append(res)
+
+    print(f"[INFO] All downloads finished! Successful: {len(downloaded)}/{len(urls)}")
+    return downloaded
+
+def download_media_for_query(query: str, folder: Path) -> list[Path]:
+    """
+    Search all providers (Pixabay, Pexels, Unsplash, Jamendo) for the query
+    and download results concurrently.
+    """
+    # Collect URLs from all search providers
+    urls = []
+    urls += _search_pixabay_images(query)
+    urls += _search_pixabay_videos(query)
+    urls += _search_pexels_images(query)
+    urls += _search_pexels_videos(query)
+    urls += _search_unsplash(query)
+    urls += _search_jamendo_music(query)
+
+    if not urls:
+        print(f"[WARN] No URLs found for query: {query}")
+        return []
+
+    # Deduplicate
+    urls = list(dict.fromkeys(urls))
+
+    # Run async batch downloader
+    return asyncio.run(_download_all(urls, folder))
+
+# ──────────────────────  manifest helpers (user-specific) ────────────────
+def _prune_missing(man: dict[str, list], user_id: int = None, project_id: int = None) -> dict[str, list]:
+    dirty = False
+    for k in ("media_clips", "music_clips"):
+        lst = man.get(k, [])
+        for i, p in enumerate(lst):
+            if p and not Path(p).exists():
+                lst[i] = "";
+                dirty = True
+        man[k] = lst
+    if dirty:
+        _save_manifest(man, user_id, project_id)
+    return man
+
+
+def _load_manifest(user_id: int = None, project_id: int = None) -> dict[str, list]:
+    if user_id and project_id:
+        clips_json = get_workspace_file(user_id, project_id, CLIPS_JSON_NAME)
+    else:
+        # Fallback for backward compatibility
+        clips_json = _get_legacy_workspace() / CLIPS_JSON_NAME
+
+    if not clips_json.exists():
+        return {"media_clips": [], "music_clips": [], "subtitles": []}
+    try:
+        return _prune_missing(json.loads(clips_json.read_text()), user_id, project_id)
+    except Exception:
+        return {"media_clips": [], "music_clips": [], "subtitles": []}
+
+
+def _save_manifest(man: dict[str, list], user_id: int = None, project_id: int = None) -> None:
+    if user_id and project_id:
+        clips_json = get_workspace_file(user_id, project_id, CLIPS_JSON_NAME)
+    else:
+        clips_json = _get_legacy_workspace() / CLIPS_JSON_NAME
+
+    with tempfile.NamedTemporaryFile("w", delete=False,
+                                     dir=clips_json.parent,
+                                     encoding="utf-8") as fh:
+        json.dump(man, fh, indent=2, ensure_ascii=False)
+        Path(fh.name).replace(clips_json)
+
+
+def _empty_manifest(user_id: int = None, project_id: int = None) -> None:
+    _save_manifest({"media_clips": [], "music_clips": [], "subtitles": []}, user_id, project_id)
+    _video_duration.cache_clear()
+    _audio_duration.cache_clear()
+
+
+def manifest_is_ready(user_id: int = None, project_id: int = None) -> bool:
+    """Used by /api/regen_ready polling route."""
+    man = _load_manifest(user_id, project_id)
+    return any(man.get("media_clips")) or any(man.get("music_clips"))
+
+
+# ──────────────────────  clip helpers (user-specific) ─────────────
+def add_clip(row: int, path: Path, clip_type="media", user_id: int = None, project_id: int = None) -> dict:
+    key = "music_clips" if clip_type == "music" else "media_clips"
+    dur = _audio_duration(str(path)) if key == "music_clips" \
+         else _media_info(str(path))[1]
+    with _LOCK:
+        man = _load_manifest(user_id, project_id)
+        lst = man.get(key, [])
+        if row >= len(lst):
+            lst += [""] * (row - len(lst) + 1)
+        lst[row] = str(path)
+        man[key] = lst
+        _save_manifest(man, user_id, project_id)
+    return {"id": row, "type": clip_type, "path": str(path), "duration": dur}
+
+def _fmt(sec: float) -> str:
+    i = int(round(sec)); h, m = divmod(i, 3600); m, s = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+def _rows(man: dict[str, list]) -> list[dict]:
+    media, music, subs = man["media_clips"], man["music_clips"], man["subtitles"]
+    rows, cum_m, cum_mu = [], 0.0, 0.0
+    n = max(len(media), len(music), len(subs))
+
+    for i in range(n):
+        # Process media clip with error handling
+        try:
+            raw_m = media[i] if i < len(media) else ""
+            rel_m = _to_uploads(raw_m) if raw_m else "";
+            m_url = f"/uploads/{rel_m}" if rel_m else ""
+            m_type, m_dur = _media_info(raw_m) if raw_m else ("", 0.0)
+        except Exception as e:
+            print(f"Error processing media clip at index {i}: {str(e)}")
+            raw_m = media[i] if i < len(media) else ""
+            rel_m = _to_uploads(raw_m) if raw_m else "";
+            m_url = f"/uploads/{rel_m}" if rel_m else ""
+            m_type, m_dur = "Unknown", 0.0
+
+        m_start, m_end = cum_m, cum_m + m_dur;
+        cum_m = m_end
+
+        # Process music clip with error handling
+        try:
+            raw_mu = music[i] if i < len(music) else ""
+            rel_mu = _to_uploads(raw_mu) if raw_mu else "";
+            mu_url = f"/uploads/{rel_mu}" if rel_mu else ""
+            mu_dur = _audio_duration(raw_mu) if raw_mu else 0.0
+        except Exception as e:
+            print(f"Error processing music clip at index {i}: {str(e)}")
+            raw_mu = music[i] if i < len(music) else ""
+            rel_mu = _to_uploads(raw_mu) if raw_mu else "";
+            mu_url = f"/uploads/{rel_mu}" if rel_mu else ""
+            mu_dur = 0.0
+
+        mu_start, mu_end = cum_mu, cum_mu + mu_dur;
+        cum_mu = mu_end
+
+        # Process subtitle
+        if i < len(subs) and len(subs[i]) == 3:
+            s_st, s_et, s_txt = subs[i]
+        else:
+            s_st = s_et = 0.0;
+            s_txt = ""
+
+        # Create row with all the information
+        try:
+            rows.append({
+                "id": i,
+                "media": m_url, "music": mu_url,
+                "media_type": m_type, "media_file": os.path.basename(raw_m) if raw_m else "",
+                "media_dur": m_dur, "media_start": m_start, "media_end": m_end,
+                "media_dur_str": _fmt(m_dur), "media_start_str": _fmt(m_start), "media_end_str": _fmt(m_end),
+                "music_file": os.path.basename(raw_mu) if raw_mu else "",
+                "music_dur": mu_dur, "music_start": mu_start, "music_end": mu_end,
+                "music_dur_str": _fmt(mu_dur), "music_start_str": _fmt(mu_start), "music_end_str": _fmt(mu_end),
+                "subtitle": s_txt,
+                "sub_start": s_st, "sub_end": s_et,
+                "sub_start_str": _fmt(s_st), "sub_end_str": _fmt(s_et),
+            })
+        except Exception as e:
+            print(f"Error creating row data for index {i}: {str(e)}")
+            rows.append({
+                "id": i,
+                "media": m_url, "music": mu_url,
+                "media_type": m_type, "media_file": os.path.basename(raw_m) if raw_m else "",
+                "media_dur": m_dur, "media_start": m_start, "media_end": m_end,
+                "media_dur_str": "0:00", "media_start_str": "0:00", "media_end_str": "0:00",
+                "music_file": os.path.basename(raw_mu) if raw_mu else "",
+                "music_dur": mu_dur, "music_start": mu_start, "music_end": mu_end,
+                "music_dur_str": "0:00", "music_start_str": "0:00", "music_end_str": "0:00",
+                "subtitle": s_txt,
+                "sub_start": s_st, "sub_end": s_et,
+                "sub_start_str": "0:00", "sub_end_str": "0:00",
+            })
+
+    return rows
+
+def _compact(lst: list[str]) -> list[str]:
+    """Remove all empty strings from lst and return a NEW list."""
+    return [p for p in lst if p]
+
+def _pad(lst: list[str], n_blank: int = 5) -> list[str]:
+    """Ensure list ends with at least n_blank empty strings."""
+    need = max(0, n_blank - lst.count(""))
+    return lst + [""] * need
+
+def list_clips(user_id: int = None, project_id: int = None) -> list[dict]:
+    man = _load_manifest(user_id, project_id)
+    man["media_clips"] = _pad(_compact(man.get("media_clips", [])))
+    man["music_clips"] = _pad(_compact(man.get("music_clips", [])))
+    return _rows(man)
+
+def replace_clip(row: int,
+                 new_file: str | Path | FileStorage,
+                 clip_type: str = "media",
+                 user_id: int = None,
+                 project_id: int = None) -> tuple[bool, str]:
+    """
+    Replace a clip at specified row with user-specific workspace support
+    """
+    clip_type = clip_type if clip_type == "music" else "media"
+    row = int(row)
+
+    if user_id and project_id:
+        workspace = get_user_workspace_path(user_id, project_id)
+    else:
+        workspace = _get_legacy_workspace()
+
+    dest_dir = workspace / clip_type
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if isinstance(new_file, FileStorage):
+            dest = dest_dir / new_file.filename
+            new_file.save(dest)
+        else:
+            src = Path(new_file)
+            if not src.exists():
+                return False, f"source file {src} not found"
+            dest = dest_dir / src.name
+            if src != dest:
+                shutil.copy2(src, dest)
+    except Exception as exc:
+        return False, str(exc)
+
+    key = "music_clips" if clip_type == "music" else "media_clips"
+    with _LOCK:
+        man = _load_manifest(user_id, project_id)
+        lst = man.get(key, [])
+        if row >= len(lst):
+            lst += [""] * (row - len(lst) + 1)
+        lst[row] = str(dest)
+        man[key] = lst
+        _save_manifest(man, user_id, project_id)
+
+    return True, "clip replaced"
+
+def clear_clip_field(self, rows, field='media', user_id: int = None, project_id: int = None):
+    """Clear specific clips from the manifest"""
+    try:
+        valid_rows = []
+        for i in rows:
+            if i is not None:
+                try:
+                    valid_rows.append(int(i))
+                except (ValueError, TypeError):
+                    print(f"Invalid row index: {i}")
+                    continue
+
+        if not valid_rows:
+            print("No valid row indices provided for deletion")
+            return
+
+        idx_list = sorted(valid_rows)
+        print(f"Clearing {field} clips at indices: {idx_list}")
+
+        manifest = _load_manifest(user_id, project_id)
+        if not manifest or field not in manifest:
+            print(f"No {field} data found in manifest")
+            return
+
+        for idx in reversed(idx_list):
+            array_idx = idx - 1
+            if 0 <= array_idx < len(manifest[field]):
+                removed_item = manifest[field].pop(array_idx)
+                print(f"Removed {field} clip at index {array_idx}")
+            else:
+                print(f"Index {array_idx} out of range for {field}")
+
+        _save_manifest(manifest, user_id, project_id)
+        print(f"Successfully cleared {len(idx_list)} {field} clips")
+
+    except Exception as e:
+        print(f"Error in clear_clip_field: {e}")
+        raise
+
+def reorder_clips(order_dict: dict, user_id: int = None, project_id: int = None) -> None:
+    """Reorder clips with user-specific workspace support"""
+    with _LOCK:
+        man = _load_manifest(user_id, project_id)
+        for field in ("media", "music"):
+            if field not in order_dict:
+                continue
+            key = "music_clips" if field == "music" else "media_clips"
+            lst = man.get(key, [])
+            new_order = [lst[i] for i in order_dict[field] if i < len(lst)]
+            man[key] = _pad(_compact(new_order))
+        _save_manifest(man, user_id, project_id)
+
+# ──────────────────────  script / SEO / voice helpers ─────────
+async def _edge_voice_names() -> list[str]:
+    voices = await edge_tts.list_voices()
+    return [v["ShortName"] for v in voices]
+
+def get_voice_list() -> list[str]:
+    if not hasattr(get_voice_list, "cache"):
+        get_voice_list.cache = asyncio.run(_edge_voice_names()) if _edge else [DEFAULT_VOICE]
+    return get_voice_list.cache
+
+def _chatgpt(prompt: str, model="gpt-3.5-turbo", temperature=0.7, max_tokens=800) -> str:
+    if not (_openai and os.getenv("OPENAI_API_KEY")):
+        return "(ChatGPT disabled)"
+    try:
+        rsp = _openai_client.chat.completions.create(
+            model=model, temperature=temperature, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}])
+        return rsp.choices[0].message.content.strip()
+    except Exception as exc:
+        return f"(OpenAI error: {exc})"
+
+def generate_text(prompt: str) -> str:
+    return _chatgpt(prompt)
+
+def seo_extract_keywords(video_title: str) -> str:
+    prompt = (f"Provide the top 5 SEO optimized keywords and tags for the video title: '{video_title}'. "
+              "Return only clear multi-word relevant keywords as a comma-separated string.")
+    result = generate_text(prompt)
+    return result
+
+def _seo_keywords(title: str) -> list[str]:
+    if not (_openai and os.getenv("OPENAI_API_KEY")):
+        return ["ChatGPT", "disabled"]
+
+    try:
+        prompt = (f"Provide the top 5 SEO optimized keywords and tags for the video title: '{title}'. "
+                  "Return only clear multi-word relevant keywords as a comma-separated string.")
+
+        rsp = _openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            temperature=0.7,
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        keyword_string = rsp.choices[0].message.content.strip()
+        return [k.strip() for k in keyword_string.split(",") if k.strip()]
+    except Exception as exc:
+        print(f"Error generating keywords: {exc}")
+        return [f"Error: {exc}"]
+
+def suggest_keywords(title: str, prompt: str = "") -> list[str]:
+    """Generate SEO-optimized keywords for a video title."""
+    print(f"suggest_keywords called with title: {title}")
+
+    if _openai and os.getenv("OPENAI_API_KEY"):
+        try:
+            print("Using OpenAI for SEO keywords")
+            seo_prompt = (f"Please provide the top 5 SEO optimized keywords and tags for the video title: '{title}'. "
+                          "Return only clear multi-word relevant keywords as a comma-separated string.")
+
+            print(f"SEO prompt: {seo_prompt}")
+
+            rsp = _openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                temperature=0.7,
+                max_tokens=800,
+                messages=[{"role": "user", "content": seo_prompt}]
+            )
+
+            keyword_string = rsp.choices[0].message.content.strip()
+            print(f"OpenAI response: {keyword_string}")
+
+            keywords = [k.strip() for k in keyword_string.split(",") if k.strip()]
+            print(f"Final keywords: {keywords}")
+            return keywords
+        except Exception as exc:
+            print(f"Error generating SEO keywords: {exc}")
+    else:
+        print("OpenAI not configured, using fallback method")
+
+    words = re.findall(r"\w{5,}", (title + " " + prompt).lower())
+    fallback_keywords = [w for w, _ in Counter(words).most_common()][:12]
+    print(f"Fallback keywords: {fallback_keywords}")
+    return fallback_keywords
+
+# ─── NEW SINGLE-PASS AUDIO/SRT PIPELINE ─────────────────────────────────
+from pydub import AudioSegment
+
+def make_voice_and_srt(
+    script: str,
+    srt_path,
+    tts_client,
+    voice_cfg,
+    return_duration: bool = False,
+):
+    """Generate TTS audio plus an .srt subtitle file."""
+    audio_path = tts_client.synthesize(script, voice_cfg)
+
+    subtitle_info = _script_to_srt(script, srt_path)
+
+    if return_duration:
+        duration = AudioSegment.from_file(audio_path).duration_seconds
+        return audio_path, subtitle_info, duration
+
+    return audio_path, subtitle_info
+
+def _script_to_srt(text: str, srt: Path, voice: str = "en-US-AriaNeural", max_line=45) -> dict:
+    """
+    Convert script text to SRT subtitle file with *real audio-based timing*.
+    Each subtitle line is synthesized with edge-tts, measured with pydub,
+    and written to the .srt file with accurate timings.
+    """
+    import re, uuid, tempfile, asyncio, json, datetime
+    from pydub import AudioSegment
+    import edge_tts
+
+    # 1. Split text into sentences
+    sentences = re.split(r'(?<=[.!?]) +', text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    all_lines = []
+    sentence_boundaries = []
+
+    for sentence in sentences:
+        if not sentence.endswith(('.', '!', '?')):
+            sentence += '.'
+
+        words = sentence.split()
+        lines, curr = [], []
+
+        for w in words:
+            cand = " ".join(curr + [w])
+            if len(cand) <= max_line:
+                curr.append(w)
+            else:
+                if curr:
+                    lines.append(" ".join(curr))
+                curr = [w]
+        if curr:
+            lines.append(" ".join(curr))
+
+        for i, line in enumerate(lines):
+            all_lines.append(line)
+            sentence_boundaries.append(i == len(lines) - 1)
+
+    if not all_lines:
+        return {"segments": [], "total_duration": 0}
+
+    segments = []
+    start_time = 0.0
+
+    with srt.open("w", encoding="utf-8") as fh:
+        for idx, (line, is_sentence_end) in enumerate(zip(all_lines, sentence_boundaries), start=1):
+            # --- Generate TTS audio for the line ---
+            temp_mp3 = Path(tempfile.gettempdir()) / f"tts_{uuid.uuid4().hex}.mp3"
+            tts = edge_tts.Communicate(line, voice)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(tts.save(str(temp_mp3)))
+            finally:
+                loop.close()
+
+            # --- Measure duration ---
+            audio = AudioSegment.from_file(temp_mp3)
+            duration = audio.duration_seconds
+            temp_mp3.unlink(missing_ok=True)
+
+            # --- Assign times ---
+            end_time = start_time + duration
+            start_formatted = str(datetime.timedelta(seconds=start_time))[:-3]
+            end_formatted = str(datetime.timedelta(seconds=end_time))[:-3]
+
+            fh.write(f"{idx}\n")
+            fh.write(f"{start_formatted.replace('.', ',')} --> {end_formatted.replace('.', ',')}\n")
+            fh.write(f"{line}\n\n")
+
+            segments.append({
+                "text": line,
+                "start": start_time,
+                "end": end_time,
+                "duration": duration,
+                "is_sentence_end": is_sentence_end
+            })
+
+            start_time = end_time
+
+    return {"segments": segments, "total_duration": start_time}
+
+
+def _srt_to_mp3(srt_path: Path, voice: str, out_path: Path, user_id: int = None, project_id: int = None) -> float:
+    """Convert SRT file to voiceover MP3 with proper timing alignment."""
+    if not srt_path.exists():
+        return 0.0
+
+    try:
+        import pysrt
+        import asyncio
+        import edge_tts
+
+        subs = pysrt.open(str(srt_path))
+
+        if user_id and project_id:
+            workspace = get_user_workspace_path(user_id, project_id)
+        else:
+            workspace = _get_legacy_workspace()
+
+        temp_dir = workspace / "temp_audio"
+        temp_dir.mkdir(exist_ok=True)
+
+        subtitle_entries = []
+        text_parts = []
+
+        man = _load_manifest(user_id, project_id)
+        segments = man.get('subtitle_segments', [])
+
+        for i, sub in enumerate(subs):
+            text = sub.text.strip()
+            if not text:
+                continue
+
+            subtitle_entries.append([
+                sub.start.ordinal / 1000.0,
+                sub.end.ordinal / 1000.0,
+                text
+            ])
+
+            text_parts.append(text)
+
+            if i < len(segments) and segments[i].get('is_sentence_end', False):
+                text_parts.append('<break time="300ms"/>')
+            else:
+                text_parts.append('<break time="100ms"/>')
+
+        combined_text = ' '.join(text_parts)
+        combined_text = f'<speak>{combined_text}</speak>'
+
+        print(f"[engine] Combined SSML text: {combined_text[:200]}...")
+
+        combined_path = temp_dir / "combined_voiceover.mp3"
+
+        async def generate_combined_audio():
+            try:
+                communicate = edge_tts.Communicate(combined_text, voice)
+                await communicate.save(str(combined_path))
+                return True
+            except Exception as e:
+                print(f"[engine] Error generating SSML audio: {e}")
+                try:
+                    plain_text = ' '.join([part for part in text_parts if not part.startswith('<')])
+                    communicate = edge_tts.Communicate(plain_text, voice)
+                    await communicate.save(str(combined_path))
+                    return True
+                except Exception as e2:
+                    print(f"[engine] Error generating plain text audio: {e2}")
+                    return False
+
+        loop = asyncio.new_event_loop()
+        try:
+            success = loop.run_until_complete(generate_combined_audio())
+        finally:
+            loop.close()
+
+        if not success or not combined_path.exists():
+            return 0.0
+
+        combined_duration = _get_audio_duration(combined_path)
+
+        import shutil
+        shutil.copy(combined_path, out_path)
+
+        if subtitle_entries and combined_duration > 0:
+            original_duration = subtitle_entries[-1][1] if subtitle_entries else 0
+
+            if original_duration > 0:
+                scale_factor = combined_duration / original_duration
+                print(f"[engine] Scaling subtitles by {scale_factor:.3f} to match voiceover")
+
+                scaled_entries = []
+                for start, end, text in subtitle_entries:
+                    scaled_entries.append([
+                        start * scale_factor,
+                        end * scale_factor,
+                        text
+                    ])
+                subtitle_entries = scaled_entries
+
+        man = _load_manifest(user_id, project_id)
+        man["subtitles"] = subtitle_entries
+        man["voiceover_duration"] = combined_duration
+        _save_manifest(man, user_id, project_id)
+
+        combined_path.unlink(missing_ok=True)
+        if temp_dir.exists():
+            temp_dir.rmdir()
+
+        return combined_duration
+
+    except Exception as e:
+        print(f"[engine] Error in _srt_to_mp3: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0.0
+
+# Rest of the subtitle and audio processing functions remain the same but add user_id/project_id params
+def _create_ass_subtitles(subtitles, output_path, video_duration, platform_key="youtube",
+                          resolution=(1280, 720), voiceover_duration=None):
+    """Create ASS subtitle file with proper synchronization."""
+    width, height = resolution
+
+    if platform_key.lower() in ["youtube", "facebook"]:
+        font_size = 70
+    else:
+        font_size = 50
+
+    margin_v = int(height * 0.25)
+
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+Timer: 100.0000
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,10,10,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(ass_header)
+
+        for start, end, text in subtitles:
+            start_fmt = _format_ass_time(start)
+            end_fmt = _format_ass_time(end)
+            f.write(f"Dialogue: 0,{start_fmt},{end_fmt},Default,,0,0,0,,{text}\n")
+
+def _format_ass_time(seconds):
+    """Format time in seconds to h:mm:ss.cc for ASS subtitles."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = seconds % 60
+    centiseconds = int((seconds - int(seconds)) * 100)
+    return f"{hours}:{minutes:02d}:{int(seconds):02d}.{centiseconds:02d}"
+
+def _get_audio_duration(path: Path) -> float:
+    """Get the duration of an audio file in seconds."""
+    try:
+        output = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+        ], text=True)
+        return float(output.strip())
+    except Exception:
+        return 0.0
+
+def _adjust_subtitle_timing(srt_path: Path, time_factor: float) -> None:
+    """Adjust the timing in an SRT file by the given factor."""
+    lines = srt_path.read_text().splitlines()
+    new_lines = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        new_lines.append(line)
+
+        if "-->" in line:
+            start, end = line.split(" --> ")
+            start_time = _parse_srt_time(start)
+            end_time = _parse_srt_time(end)
+
+            new_start = start_time * time_factor
+            new_end = end_time * time_factor
+
+            new_start_str = _format_srt_time(new_start)
+            new_end_str = _format_srt_time(new_end)
+
+            new_lines[-1] = f"{new_start_str} --> {new_end_str}"
+
+        i += 1
+
+    srt_path.write_text("\n".join(new_lines))
+
+
+def _parse_srt_time(time_str: str) -> float:
+    """Parse SRT timestamp into seconds."""
+    time_str = time_str.replace(',', '.')
+
+    parts = time_str.split(':')
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    elif len(parts) == 2:
+        minutes, seconds = parts
+        return int(minutes) * 60 + float(seconds)
+    else:
+        print(f"[engine] Warning: Unexpected timestamp format: {time_str}")
+        return 0.0
+
+
+def _format_srt_time(seconds: float) -> str:
+    """Format seconds into SRT timestamp."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}".replace('.', ',')
+
+
+def _wrap_text(text, max_line=45):
+    """Wrap text to a maximum line length for ASS subtitles."""
+    if len(text) <= max_line:
+        return text
+
+    words = text.split()
+    lines = []
+    current_line = ""
+
+    for word in words:
+        if len(current_line) + len(word) + 1 <= max_line:
+            if current_line:
+                current_line += " "
+            current_line += word
+        else:
+            lines.append(current_line)
+            current_line = word
+
+    if current_line:
+        lines.append(current_line)
+
+    return "\\N".join(lines)
+
+
+# ──────────────────────  Main tab save function (user-specific) ─────────────
+def save_main_tab(form: dict, user_id: int = None, project_id: int = None) -> tuple[bool, str]:
+    try:
+        title = form.get("video_title", "").strip()
+        lang = form.get("target_language", "en")
+        voice = form.get("voice", "en-US-JennyNeural")
+        genre = form.get("genre", "general")
+        platform = form.get("platform", "YouTube").lower().replace(" ", "_")
+
+        if not title:
+            return False, "Video title is required"
+
+        # Set up workspace paths
+        if user_id and project_id:
+            workspace = get_user_workspace_path(user_id, project_id)
+            script_file = get_workspace_file(user_id, project_id, SCRIPT_FILE_NAME)
+            platform_file = get_workspace_file(user_id, project_id, PLATFORM_FILE_NAME)
+            keywords_file = get_workspace_file(user_id, project_id, KEYWORDS_FILE_NAME)
+            genre_file = get_workspace_file(user_id, project_id, SELECTED_GENRE_FILE_NAME)
+            voice_file = get_workspace_file(user_id, project_id, LAST_VOICE_FILE_NAME)
+        else:
+            workspace = _get_legacy_workspace()
+            script_file = workspace / SCRIPT_FILE_NAME
+            platform_file = workspace / PLATFORM_FILE_NAME
+            keywords_file = workspace / KEYWORDS_FILE_NAME
+            genre_file = workspace / SELECTED_GENRE_FILE_NAME
+            voice_file = workspace / LAST_VOICE_FILE_NAME
+
+        # Save platform preference
+        platform_file.write_text(platform)
+
+        # Handle keywords
+        kw_raw = (form.get("keywords") or "").strip()
+        if kw_raw:
+            kw = [k.strip() for k in kw_raw.split(",") if k.strip()]
+        else:
+            # Generate SEO keywords if not provided
+            print(f"Generating SEO keywords for title: {title}")
+            kw = suggest_keywords(title)[:5]  # Get top 5 keywords
+
+        keywords_file.write_text(", ".join(kw))
+        genre_file.write_text(genre)
+        voice_file.write_text(voice)
+
+        # Generate script with better prompt based on genre
+        tone_map = {
+            'educational': 'informative and educational',
+            'entertainment': 'entertaining and engaging',
+            'news': 'professional and newsworthy',
+            'tutorial': 'clear and instructional',
+            'vlog': 'personal and conversational',
+            'ambient': 'calming and descriptive',
+            'soundtrack': 'evocative and atmospheric',
+            'general': 'engaging and versatile'
+        }
+
+        tone = tone_map.get(genre.lower(), 'engaging and versatile')
+
+        # Use the existing _chatgpt function with appropriate prompt
+        prompt = f"""Write a {tone} video script about: {title}
+
+Requirements:
+- Language: {lang}
+- Platform: {platform}
+- Length: 60-90 seconds of narration
+- Style: Natural speaking voice, no scene directions
+- Format: Clear sentences that flow naturally when read aloud
+
+Write ONLY the narration text. Do not include any brackets, stage directions, or technical notes."""
+
+        # Generate script using the existing _chatgpt function
+        try:
+            script_content = _chatgpt(prompt, max_tokens=800)
+
+            if not script_content or "error" in script_content.lower():
+                raise Exception("Failed to generate script")
+
+        except Exception as e:
+            print(f"Error generating script: {e}")
+            # Fallback script
+            script_content = f"""Welcome to our {genre} video about {title}.
+
+Today, we'll explore the fascinating aspects of {title}.
+This topic has captured the attention of many people worldwide.
+
+{title} represents an important area that deserves our attention.
+Understanding it better can provide valuable insights and benefits.
+
+Let's dive deeper into what makes {title} so interesting.
+There are several key points to consider when discussing this subject.
+
+In conclusion, {title} offers many opportunities for learning and growth.
+Thank you for watching!"""
+
+        script_file.write_text(script_content)
+
+        return True, "Script generated successfully!"
+
+    except Exception as exc:
+        print(f"Error in save_main_tab: {exc}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Error: {exc}"
+
+
+def _get_current_platform_settings(user_id: int = None, project_id: int = None):
+    """Get output settings for the currently selected platform"""
+    try:
+        if user_id and project_id:
+            platform_file = get_workspace_file(user_id, project_id, PLATFORM_FILE_NAME)
+        else:
+            platform_file = _get_legacy_workspace() / PLATFORM_FILE_NAME
+
+        if platform_file.exists():
+            platform = platform_file.read_text().strip().lower()
+        else:
+            platform = "youtube"
+
+        platform_key = platform.replace(" ", "_")
+        if platform_key not in output_settings:
+            platform_key = "youtube"
+
+        return platform_key, output_settings[platform_key]
+    except Exception as e:
+        print(f"[engine] Error getting platform settings: {e}")
+        return "youtube", output_settings["youtube"]
+
+
+def _is_media_suitable_for_platform(url: str, platform_key: str) -> bool:
+    """Check if media (image/video) is suitable for the current platform orientation"""
+    try:
+        if not url or not isinstance(url, str):
+            return True
+
+        if "_tiny.mp4" in url or "_small.mp4" in url or "_medium.mp4" in url or "_large.mp4" in url:
+            base_url = url.split("_tiny.mp4")[0] if "_tiny.mp4" in url else \
+                url.split("_small.mp4")[0] if "_small.mp4" in url else \
+                    url.split("_medium.mp4")[0] if "_medium.mp4" in url else \
+                        url.split("_large.mp4")[0]
+            return True
+
+        return True
+    except Exception as e:
+        print(f"[engine] Error checking media suitability: {e}")
+        return True
+
+
+def _select_appropriate_video_size(url: str, platform_key: str) -> str:
+    """Select the appropriate video size version based on platform"""
+    if not url or not isinstance(url, str):
+        return url
+
+    if "_tiny.mp4" in url or "_small.mp4" in url or "_medium.mp4" in url or "_large.mp4" in url:
+        base_url = url.split("_tiny.mp4")[0] if "_tiny.mp4" in url else \
+            url.split("_small.mp4")[0] if "_small.mp4" in url else \
+                url.split("_medium.mp4")[0] if "_medium.mp4" in url else \
+                    url.split("_large.mp4")[0] if "_large.mp4" in url else url
+
+        if platform_key in PORTRAIT_PLATFORMS:
+            if requests:
+                medium_url = f"{base_url}_medium.mp4"
+                try:
+                    response = requests.head(medium_url, timeout=5)
+                    if response.status_code == 200:
+                        return medium_url
+                except:
+                    pass
+
+                small_url = f"{base_url}_small.mp4"
+                try:
+                    response = requests.head(small_url, timeout=5)
+                    if response.status_code == 200:
+                        return small_url
+                except:
+                    pass
+
+            return url
+        else:
+            if requests:
+                large_url = f"{base_url}_large.mp4"
+                try:
+                    response = requests.head(large_url, timeout=5)
+                    if response.status_code == 200:
+                        return large_url
+                except:
+                    pass
+
+            return url
+
+    return url
+
+
+# ──────────────────────  regeneration thread (user-specific) ──────────────────
+def save_script_and_regenerate(script: str, user_id: Optional[int] = None,
+                               project_id: Optional[int] = None,
+                               workspace_dir: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Save script and regenerate assets with user-specific workspace support
+    """
+    try:
+        if workspace_dir:
+            workspace = Path(workspace_dir)
+        elif user_id and project_id:
+            workspace = get_user_workspace_path(user_id, project_id)
+        else:
+            workspace = _get_legacy_workspace()
+
+        script_file = workspace / SCRIPT_FILE_NAME
+        script_file.write_text(script, encoding="utf-8")
+
+        threading.Thread(
+            target=_heavy_regenerate_wrapper,
+            args=(script, user_id, project_id),
+            daemon=True
+        ).start()
+
+        return True, "Script saved, regenerating assets..."
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return False, f"Error saving script: {e}"
+
+
+def _heavy_regenerate_wrapper(script: str, user_id: Optional[int], project_id: Optional[int]) -> None:
+    # Check if already processing
+    lock_key = f"{user_id}_{project_id}"
+    if lock_key in processing_locks:
+        print(f"[engine] Already processing for project {project_id}, skipping duplicate")
+        return
+
+    processing_locks[lock_key] = True
+    """
+    Wrapper around heavy regenerate with project status updates
+    """
+    import traceback
+    error = False
+
+    try:
+        _heavy_regenerate(script, user_id, project_id)
+    except Exception:
+        error = True
+        traceback.print_exc()
+    finally:
+        # Clean up processing lock
+        lock_key = f"{user_id}_{project_id}"
+        processing_locks.pop(lock_key, None)
+
+        if user_id is not None and project_id is not None:
+            try:
+                from app import app
+                from models import db, Project
+                with app.app_context():
+                    proj = Project.query.filter_by(id=project_id, user_id=user_id).first()
+                    if proj:
+                        proj.status = "error" if error else "complete"
+                        db.session.commit()
+            except Exception as e:
+                print(f"[engine] Failed to update project status: {e}")
+
+
+def _heavy_regenerate(script: str, user_id: Optional[int] = None, project_id: Optional[int] = None) -> None:
+    """Background thread that builds all assets + manifest with user-specific workspace."""
+    try:
+        if user_id and project_id:
+            workspace = get_user_workspace_path(user_id, project_id)
+        else:
+            workspace = _get_legacy_workspace()
+        print(f"[DEBUG] _heavy_regenerate using workspace: {workspace} (absolute: {workspace.absolute()})")
+        platform_key, platform_settings = _get_current_platform_settings(user_id, project_id)
+        print(f"[engine] Using platform settings for: {platform_key}")
+
+        _update_status("Generating subtitles and voiceover...", user_id, project_id)
+
+        script_file = workspace / SCRIPT_FILE_NAME
+        script_file.write_text(script)
+
+        srt = workspace / "subtitles.srt"
+
+        print(f"[engine] Generating subtitles from script")
+        subtitle_info = _script_to_srt(script, srt)
+
+        print(f"[engine] Generated {len(subtitle_info['segments'])} subtitle segments "
+              f"with total duration {subtitle_info['total_duration']:.2f}s")
+
+        voice_file = workspace / LAST_VOICE_FILE_NAME
+        voice = voice_file.read_text().strip() if voice_file.exists() else DEFAULT_VOICE
+        print(f"[engine] Using voice: {voice}")
+
+        voiceover_path = workspace / "voiceover.mp3"
+        if voiceover_path.exists():
+            print(f"[engine] Found existing voiceover at {voiceover_path}, removing it")
+            voiceover_path.unlink()
+
+        print(f"[engine] Generating voiceover from full script")
+        _update_status("Generating voiceover from script...", user_id, project_id)
+
+        import asyncio
+        import edge_tts
+
+        async def generate_voiceover():
+            script_with_pauses = script.replace('. ', '... ')
+            communicate = edge_tts.Communicate(script_with_pauses, voice)
+            await communicate.save(str(voiceover_path))
+
+        # Run the async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(generate_voiceover())
+        finally:
+            loop.close()
+
+        # Get duration
+        voiceover_duration = 0
+        if voiceover_path.exists():
+            try:
+                from pydub import AudioSegment
+                audio = AudioSegment.from_file(voiceover_path)
+                voiceover_duration = audio.duration_seconds
+                print(f"[engine] Voiceover generation completed, duration: {voiceover_duration}s")
+            except Exception as e:
+                print(f"[engine] Error reading voiceover duration with pydub: {e}")
+                try:
+                    import subprocess
+                    out = subprocess.check_output(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", str(voiceover_path)],
+                        text=True
+                    )
+                    voiceover_duration = float(out.strip())
+                except Exception as e2:
+                    print(f"[engine] Error reading voiceover duration with ffprobe: {e2}")
+                    voiceover_duration = subtitle_info["total_duration"]
+        else:
+            print(f"[engine] WARNING: Voiceover file was not created")
+            voiceover_duration = subtitle_info["total_duration"]
+
+        print(f"[engine] Voiceover file exists: {voiceover_path.exists()}")
+
+        if not voiceover_path.exists() or voiceover_duration <= 0:
+            print(f"[engine] WARNING: Voiceover generation failed, trying alternative method")
+            _update_status("Trying alternative voiceover generation...", user_id, project_id)
+
+            try:
+                async def generate_full_voiceover():
+                    try:
+                        full_text = script.replace('. ', '... ')
+                        communicate = edge_tts.Communicate(full_text, voice)
+                        await communicate.save(str(voiceover_path))
+                        return True
+                    except Exception as e:
+                        print(f"[engine] Alternative voiceover generation error: {e}")
+                        return False
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    success = loop.run_until_complete(generate_full_voiceover())
+                    if success and voiceover_path.exists():
+                        print(f"[engine] Alternative voiceover generation succeeded")
+                        try:
+                            import subprocess
+                            out = subprocess.check_output(
+                                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1", str(voiceover_path)],
+                                text=True
+                            )
+                            voiceover_duration = float(out.strip())
+                            print(f"[engine] Alternative voiceover duration: {voiceover_duration}s")
+                        except Exception as e:
+                            print(f"[engine] Error getting alternative voiceover duration: {e}")
+                            voiceover_duration = subtitle_info["total_duration"]
+                    else:
+                        print(f"[engine] Alternative voiceover generation failed")
+                finally:
+                    loop.close()
+            except Exception as e:
+                print(f"[engine] Error in alternative voiceover generation: {e}")
+                import traceback
+                traceback.print_exc()
+
+        if voiceover_duration > 0:
+            subtitle_ratio = voiceover_duration / subtitle_info["total_duration"]
+            if abs(subtitle_ratio - 1.0) > 0.1:
+                print(f"[engine] Adjusting subtitle timing by factor {subtitle_ratio}")
+                _adjust_subtitle_timing(srt, subtitle_ratio)
+                for segment in subtitle_info["segments"]:
+                    segment["start"] *= subtitle_ratio
+                    segment["end"] *= subtitle_ratio
+                    segment["duration"] *= subtitle_ratio
+                subtitle_info["total_duration"] = voiceover_duration
+
+        _update_status("Processing keywords...", user_id, project_id)
+
+        # Read keywords from file
+        keywords_file = workspace / KEYWORDS_FILE_NAME
+        if keywords_file.exists():
+            keywords_content = keywords_file.read_text().strip()
+            kw_list = [k.strip() for k in keywords_content.split(',') if k.strip()]
+            print(f"[engine] Using keywords from file: {kw_list}")
+        else:
+            print(f"[engine] WARNING: No keywords file found at {keywords_file}")
+            kw_list = ["video"]  # Default fallback
+            print(f"[engine] Using default keywords: {kw_list}")
+
+        # Create directories
+        media_dir = workspace / "media"
+        music_dir = workspace / "music"
+        media_dir.mkdir(exist_ok=True)
+        music_dir.mkdir(exist_ok=True)
+        media_paths: list[str] = []
+        music_paths: list[str] = []
+        processed_urls = set()
+
+        total_keywords = len(kw_list)
+        current_keyword_index = 0
+
+        for kw in kw_list:
+            current_keyword_index += 1
+            progress_percent = int((current_keyword_index / total_keywords) * 100)
+            _update_status(f"Searching for media ({progress_percent}%): {kw}", user_id, project_id)
+
+            try:
+                media_urls = []
+                try:
+                    _update_status(f"Searching Pixabay images for: {kw}", user_id, project_id)
+                    media_urls.extend(_search_pixabay_images(kw))
+                    print(f"[DEBUG] Extended media_urls, now has {len(media_urls)} URLs")
+                except Exception as e:
+                    print(f"[engine] Error searching Pixabay images: {e}")
+
+                try:
+                    _update_status(f"Searching Unsplash for: {kw}", user_id, project_id)
+                    media_urls.extend(_search_unsplash(kw))
+                    print(f"[DEBUG] Extended media_urls, now has {len(media_urls)} URLs")
+                except Exception as e:
+                    print(f"[engine] Error searching Unsplash: {e}")
+
+                try:
+                    _update_status(f"Searching Pexels images for: {kw}", user_id, project_id)
+                    media_urls.extend(_search_pexels_images(kw))
+                    print(f"[DEBUG] Extended media_urls, now has {len(media_urls)} URLs")
+                except Exception as e:
+                    print(f"[engine] Error searching Pexels images: {e}")
+
+                print(f"[DEBUG] After all searches, media_urls has {len(media_urls)} items")
+                video_urls = []
+                print(f"[DEBUG] Total media_urls before videos: {len(media_urls)}")
+                try:
+                    _update_status(f"Searching Pixabay videos for: {kw}", user_id, project_id)
+                    pixabay_videos = _search_pixabay_videos(kw)
+                    print(f"[DEBUG] Pixabay videos: {len(pixabay_videos)}")
+                except Exception as e:
+                    print(f"[engine] Error searching Pixabay videos: {e}")
+                    pixabay_videos = []
+
+                try:
+                    _update_status(f"Searching Pexels videos for: {kw}", user_id, project_id)
+                    pexels_videos = _search_pexels_videos(kw)
+                    print(f"[DEBUG] Pexels videos: {len(pexels_videos)}")
+                except Exception as e:
+                    print(f"[engine] Error searching Pexels videos: {e}")
+                    pexels_videos = []
+
+                    print(f"[DEBUG] Processing {len(pixabay_videos + pexels_videos)} video URLs")
+                for url in pixabay_videos + pexels_videos:
+                    base_url = url.split("_tiny.mp4")[0] if "_tiny.mp4" in url else \
+                        url.split("_small.mp4")[0] if "_small.mp4" in url else \
+                        url.split("_medium.mp4")[0] if "_medium.mp4" in url else \
+                        url.split("_large.mp4")[0] if "_large.mp4" in url else url
+                    if base_url in processed_urls:
+                        continue
+                    processed_urls.add(base_url)
+                    selected_url = _select_appropriate_video_size(url, platform_key)
+                    video_urls.append(selected_url)
+
+                media_urls.extend(video_urls)
+                print(f"[DEBUG] After adding videos, media_urls has {len(media_urls)} items")
+                print(f"[DEBUG] Extended media_urls, now has {len(media_urls)} URLs")
+
+                print(f"[DEBUG] About to check media_urls: {len(media_urls)} URLs")
+                print(f"[DEBUG] RIGHT BEFORE DOWNLOAD CHECK - media_urls: {len(media_urls)}")
+                print(f"[DEBUG] Before checking if not media_urls: len={len(media_urls)}")
+                if not media_urls:
+                    print(f"[engine] Warning: No media found for keyword: {kw}")
+                    print(f"[DEBUG] Continuing to next keyword because media_urls is empty")
+                    continue
+
+                total_media = len(media_urls)
+                print(f"[DEBUG] Starting download loop for {len(media_urls)} media URLs")
+                for i, url in enumerate(media_urls):
+                    media_progress = int((i / total_media) * 100)
+                    _update_status(f"Downloading media for '{kw}' ({media_progress}%)...", user_id, project_id)
+                    suitable = _is_media_suitable_for_platform(url, platform_key)
+                    print(f"[DEBUG] URL {url[:50]}... suitable for {platform_key}: {suitable}")
+                    if suitable:
+                        try:
+                            base_filename = f"media_{len(media_paths) + 1}_{kw.replace(' ', '_')}"
+                            expected_type = 'image'
+                            if any(x in url.lower() for x in ['.mp4', 'video', 'pixabay/videos', 'pexels/videos']):
+                                expected_type = 'video'
+
+                            p = _download_url_with_extension(url, media_dir, expected_type, base_filename)
+                            if p and str(p) not in media_paths:
+                                media_paths.append(str(p))
+                                print(f"[engine] Downloaded media: {p}")
+                        except Exception as e:
+                            print(f"[engine] Error downloading media {url}: {e}")
+
+                try:
+                    _update_status(f"Searching music for: {kw}", user_id, project_id)
+                    music_urls = _search_jamendo_music(kw)
+                    total_music = len(music_urls)
+                    for i, url in enumerate(music_urls):
+                        music_progress = int((i / total_music) * 100)
+                        _update_status(f"Downloading music for '{kw}' ({music_progress}%)...", user_id, project_id)
+                        try:
+                            base_filename = f"music_{len(music_paths) + 1}_{kw.replace(' ', '_')}"
+                            p = _download_url_with_extension(url, music_dir, 'music', base_filename)
+                            if p and str(p) not in music_paths:
+                                music_paths.append(str(p))
+                                print(f"[engine] Downloaded music: {p}")
+                        except Exception as e:
+                            print(f"[engine] Error downloading music {url}: {e}")
+                except Exception as e:
+                    print(f"[engine] Error searching music: {e}")
+
+            except Exception as e:
+                print(f"[engine] Error processing keyword {kw}: {e}")
+                continue
+
+        if not media_paths:
+            print("[engine] Warning: No media clips downloaded. Using fallback media if available.")
+            for file in media_dir.glob("*"):
+                if file.is_file() and file.suffix.lower() in ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4',
+                                                              '.avi', '.mov', '.webm'):
+                    media_paths.append(str(file))
+
+        if not music_paths:
+            print("[engine] Warning: No music clips downloaded. Using fallback music if available.")
+            for file in music_dir.glob("*"):
+                if file.is_file() and file.suffix.lower() in ('.mp3', '.wav', '.ogg', '.aac', '.m4a'):
+                    music_paths.append(str(file))
+
+        _update_status("Building subtitle timeline...", user_id, project_id)
+        subtitles = []
+        for segment in subtitle_info["segments"]:
+            subtitles.append([segment["start"], segment["end"], segment["text"]])
+
+        _update_status("Finalizing manifest...", user_id, project_id)
+        manifest = {
+            "media_clips": media_paths,
+            "music_clips": music_paths,
+            "subtitles": subtitles,
+            "voiceover_duration": voiceover_duration,
+            "platform": platform_key
+        }
+        _save_manifest(manifest, user_id, project_id)
+        _video_duration.cache_clear()
+        _audio_duration.cache_clear()
+        _update_status("Regeneration complete", user_id, project_id)
+        print("[engine] regeneration finished")
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        _update_status("Error during regeneration. Please check the logs.", user_id, project_id)
+
+def _update_status(message: str, user_id: int = None, project_id: int = None):
+    """Update the current processing status."""
+    print(f"[engine] Status: {message}")
+
+    if user_id and project_id:
+        workspace = get_user_workspace_path(user_id, project_id)
+    else:
+        workspace = _get_legacy_workspace()
+
+    status_file = workspace / "status.txt"
+    try:
+        status_file.write_text(message)
+    except Exception as e:
+        print(f"[engine] Error writing status: {str(e)}")
+
+
+def get_current_script(user_id: int = None, project_id: int = None) -> str:
+    if user_id and project_id:
+        script_file = get_workspace_file(user_id, project_id, SCRIPT_FILE_NAME)
+    else:
+        script_file = _get_legacy_workspace() / SCRIPT_FILE_NAME
+
+    return script_file.read_text() if script_file.exists() else ""
+
+
+# ──────────────────────  final video & support stubs ───────────
+def final_generate(project_id=None, user_id=None) -> Path:
+    """Generate the final video combining media / music / subtitles."""
+    try:
+        print(f"[engine] ► starting final video generation for user {user_id}, project {project_id}")
+
+        if project_id and user_id:
+            workspace = get_user_workspace_path(user_id, project_id)
+            final_dir = get_final_dir(user_id, project_id)
+        else:
+            workspace = _get_legacy_workspace()
+            final_dir = workspace / "final"
+            final_dir.mkdir(exist_ok=True)
+
+        platform_key, platform_settings = _get_current_platform_settings(user_id, project_id)
+        output_codec = platform_settings['codec']
+        output_width, output_height = platform_settings['resolution']
+        output_fps = platform_settings['fps']
+        resolution = (output_width, output_height)
+
+        print(f"[engine] Using platform settings: {platform_key} - {output_width}x{output_height} at {output_fps}fps")
+
+        man = _load_manifest(user_id, project_id)
+        media_clips = [p for p in man.get("media_clips", []) if p and Path(p).exists()]
+        music_clips = [p for p in man.get("music_clips", []) if p and Path(p).exists()]
+        subtitles = man.get("subtitles", [])
+        voiceover_path = workspace / "voiceover.mp3"
+        has_voiceover = voiceover_path.exists()
+        voiceover_duration = man.get("voiceover_duration", 0)
+
+        if has_voiceover and not voiceover_duration:
+            try:
+                out = subprocess.check_output(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(voiceover_path)],
+                    text=True)
+                voiceover_duration = float(out.strip())
+            except Exception:
+                voiceover_duration = 0.0
+        print(f"[engine] voiceover dur = {voiceover_duration:.2f}s   media clips = {len(media_clips)}")
+
+        # Build each clip
+        temp_clips, total_duration = [], 0.0
+
+        for i, src in enumerate(media_clips):
+            dst = workspace / f"temp_{i}.mp4"
+
+            if src.lower().endswith(_VIDEO_EXTS):
+                # Process video clips with platform-specific settings
+                cmd = ["ffmpeg", "-y", "-i", src,
+                       "-vf",
+                       f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2",
+                       "-c:v", output_codec, "-pix_fmt", "yuv420p",
+                       "-preset", "ultrafast", "-crf", "28",
+                       "-r", f"{output_fps}", "-vsync", "cfr",
+                       "-an", str(dst)]
+            else:  # image → 5-second clip
+                cmd = ["ffmpeg", "-y", "-loop", "1", "-i", src,
+                       "-vf",
+                       f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2",
+                       "-c:v", output_codec, "-pix_fmt", "yuv420p", "-t", "5",
+                       "-preset", "ultrafast", "-crf", "28",
+                       "-r", f"{output_fps}", "-vsync", "cfr", str(dst)]
+
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            temp_clips.append(dst)
+
+            dur = _video_duration(str(dst))
+            total_duration += dur
+
+        print(f"[engine] total video duration after build = {total_duration:.2f}s")
+
+        # Sanity-fix subtitles
+        if subtitles:
+            for idx, trip in enumerate(subtitles):
+                st, et, _ = trip
+                if et <= st:
+                    subtitles[idx][1] = st + 3  # +3s minimum
+            if subtitles[-1][1] > total_duration:
+                subtitles[-1][1] = total_duration
+
+        # Write ASS subtitle
+        ass_file = None
+        if subtitles:
+            ass_file = workspace / "subtitles.ass"
+            _create_ass_subtitles(subtitles, ass_file, total_duration, platform_key,
+                                  resolution, voiceover_duration=voiceover_duration)
+
+        # Concat clips into video
+        concat_list = workspace / "clips.txt"
+        concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in temp_clips))
+        temp_video = workspace / "video.mp4"
+
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                        "-c:v", output_codec, "-preset", "ultrafast", "-crf", "28",
+                        str(temp_video)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Add subtitles
+        if ass_file:
+            sub_vid = workspace / "video_sub.mp4"
+            subprocess.run(["ffmpeg", "-y", "-i", str(temp_video),
+                            "-vf", f"ass={ass_file}",
+                            "-c:v", output_codec, "-preset", "ultrafast", "-crf", "28",
+                            str(sub_vid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            temp_video.unlink()
+            temp_video = sub_vid
+
+        # Add audio
+        final_path = final_dir / "final.mp4"
+
+        if has_voiceover or music_clips:
+            cmd = ["ffmpeg", "-y", "-i", str(temp_video)]
+            if has_voiceover: cmd += ["-i", str(voiceover_path)]
+            if music_clips:   cmd += ["-i", music_clips[0]]
+            if has_voiceover and music_clips:
+                cmd += ["-filter_complex", "[1:a][2:a]amix=inputs=2:duration=longest[a]",
+                        "-map", "0:v", "-map", "[a]"]
+            elif has_voiceover:
+                cmd += ["-map", "0:v", "-map", "1:a"]
+            else:  # only music
+                cmd += ["-map", "0:v", "-map", "1:a"]
+            cmd += ["-c:v", "copy", "-c:a", "aac", "-shortest", str(final_path)]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            shutil.copy(temp_video, final_path)
+
+        # Cleanup
+        for p in temp_clips:
+            p.unlink(missing_ok=True)
+        concat_list.unlink(missing_ok=True)
+        temp_video.unlink(missing_ok=True)
+        if ass_file:
+            ass_file.unlink(missing_ok=True)
+
+        print(f"[engine] ✔ video created → {final_path}")
+        return final_path
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("[engine] ❌ final_generate failed:", e)
+
+        # Return error indicator
+        if user_id and project_id:
+            error_file = get_final_dir(user_id, project_id) / "error.txt"
+        else:
+            error_file = _get_legacy_workspace() / "final" / "error.txt"
+
+        error_file.parent.mkdir(exist_ok=True)
+        error_file.write_text(str(e))
+        return error_file
+
+
+def generate_final_video(project_id, user_id) -> tuple[bool, str]:
+    """Start video generation in a separate process to avoid worker timeout"""
+    try:
+        work_dir = get_user_workspace_path(user_id, project_id)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        process_flag = work_dir / "video_processing.flag"
+        with open(process_flag, 'w') as f:
+            f.write(f"Started: {datetime.datetime.now()}")
+
+        cmd = ["python3", "-c", f"""
+import sys, os, traceback
+sys.path.insert(0, os.getcwd())
+try:
+    import engine
+    print("[background] Starting video generation for user {user_id}, project {project_id}")
+    video_path = engine.final_generate(project_id='{project_id}', user_id='{user_id}')
+    print(f"[background] Video generation complete: {{video_path}}")
+    with open("{work_dir}/video_success.flag", "w") as f:
+        f.write(f"{{video_path}}")
+except Exception as e:
+    print(f"[background] Error: {{e}}")
+    with open("{work_dir}/video_error.log", "w") as f:
+        f.write(str(e))
+        f.write("\\n\\n")
+        traceback.print_exc(file=f)
+finally:
+    if os.path.exists("{process_flag}"):
+        os.remove("{process_flag}")
+"""]
+
+        subprocess.Popen(cmd,
+                         stdout=open(work_dir / "video_gen.log", "w"),
+                         stderr=subprocess.STDOUT,
+                         start_new_session=True)
+
+        return True, "Video generation started in background. Check final tab in a few minutes."
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_render_progress(project_id, user_id) -> dict:
+    """Check the progress of video rendering"""
+    work_dir = get_user_workspace_path(user_id, project_id)
+
+    # Check if still processing
+    if (work_dir / "video_processing.flag").exists():
+        return {'running': True, 'pct': 50, 'msg': 'Processing...'}
+
+    # Check if completed
+    if (work_dir / "video_success.flag").exists():
+        return {'running': False, 'pct': 100, 'msg': 'Complete'}
+
+    # Check if error
+    if (work_dir / "video_error.log").exists():
+        return {'running': False, 'pct': 0, 'msg': 'Error occurred'}
+
+    return {'running': False, 'pct': 0, 'msg': 'Not started'}
+
+
+def final_video_path(user_id: int, project_id: int) -> str | None:
+    """Return the path to the final video, handling both naming conventions."""
+    work_dir = get_user_workspace_path(user_id, project_id)
+    final_dir = get_final_dir(user_id, project_id)
+    platform_file = work_dir / PLATFORM_FILE_NAME
+
+    # First check for the standard final.mp4
+    standard_path = final_dir / "final.mp4"
+    if standard_path.exists() and standard_path.stat().st_size > 1024:
+        return str(standard_path)
+
+    # Then check for platform-specific versions
+    try:
+        platform_key = "youtube"  # Default
+        if platform_file.exists():
+            platform_key = platform_file.read_text().strip().lower().replace(" ", "_")
+
+        platform_path = final_dir / f"final_{platform_key}.mp4"
+        if platform_path.exists() and platform_path.stat().st_size > 1024:
+            return str(platform_path)
+    except Exception as e:
+        print(f"[engine] Error checking platform video for user {user_id}, project {project_id}: {e}")
+
+    # Check for any mp4 file in the final directory
+    try:
+        for file in final_dir.glob("*.mp4"):
+            if file.stat().st_size > 1024:
+                return str(file)
+    except Exception:
+        pass
+
+    return None
+
+
+def upload_to_social_media(video_path: str, platform: str = None) -> str:
+    """Upload video to social media platform"""
+    # This is a placeholder - implement actual upload logic
+    return "https://example.com/video/12345"
+
+
+def upload_video(user_id: int, project_id: int) -> tuple[bool, str]:
+    """Upload the final video for a specific user's project"""
+    try:
+        video_path = final_video_path(user_id, project_id)
+        if not video_path:
+            return False, "No final video found to upload"
+
+        work_dir = get_user_workspace_path(user_id, project_id)
+        platform_file = work_dir / PLATFORM_FILE_NAME
+        platform = "youtube"  # default
+
+        if platform_file.exists():
+            platform = platform_file.read_text().strip().lower()
+
+        url = upload_to_social_media(video_path, platform)
+        return True, f"Uploaded to {platform} → {url}"
+
+    except Exception as exc:
+        return False, str(exc)
+
+
+# Support functions
+def save_ticket_in_repo(form: dict[str, Any], user_id: int = None) -> str:
+    sr = f"SR{datetime.datetime.utcnow():%y%m%d%H%M%S}"
+
+    if user_id:
+        # Save to user-specific directory if user_id is provided
+        user_dir = Path("support_tickets") / f"user_{user_id}"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        support_log = user_dir / "support.log"
+    else:
+        # Fallback to general location
+        support_dir = Path("support_tickets")
+        support_dir.mkdir(exist_ok=True)
+        support_log = support_dir / "support.log"
+
+    support_log.open("a", encoding="utf-8").write(
+        json.dumps(form, ensure_ascii=False) + "\n")
+    return sr
+
+
+def create_support_ticket(form: dict, user_id: int = None) -> tuple[bool, str | None, str]:
+    try:
+        sr = save_ticket_in_repo(form, user_id)
+        return True, sr, f"Support ticket {sr} created."
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def send_support_email(form: dict) -> None:
+    """Send support ticket email notification"""
+    try:
+        import smtplib
+        from email.mime.text import MimeText
+        from email.mime.multipart import MIMEMultipart
+
+        SMTP_SERVER = "smtp.hostinger.com"
+        SMTP_PORT = 587
+        SENDER_EMAIL = "system@ai-videocreator.com"
+        SENDER_PASSWORD = "SyS2025$"
+        RECIPIENT_EMAIL = "support@ai-videocreator.com"
+
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+
+        customer_email = form.get('customer_email', '')
+        recipients = [RECIPIENT_EMAIL]
+        if customer_email:
+            recipients.append(customer_email)
+            msg['Subject'] = f"Your Support Ticket {form.get('sr_number', 'Unknown')} - Receipt"
+        else:
+            msg['Subject'] = f"Support Ticket {form.get('sr_number', 'Unknown')}"
+
+        msg['To'] = ', '.join(recipients)
+
+        body = f"""
+        New Support Ticket Created
+        ========================
+        SR Number: {form.get('sr_number', 'N/A')}
+        Type: {form.get('ticket_type', 'N/A')}
+        Name: {form.get('customer_name', 'N/A')}
+        Email: {form.get('customer_email', 'N/A')}
+        Phone: {form.get('phone', 'N/A')}
+        Video Name: {form.get('video_name', 'N/A')}
+        Created: {form.get('creation_dt', 'N/A')}
+
+        Issue Description:
+        {form.get('issue_description', 'N/A')}
+
+        Additional Details:
+        {form.get('desc', 'N/A' if not form.get('desc') else form.get('desc'))}
+        """
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+
+        print(f"Support email sent for {form.get('sr_number')}")
+
+    except Exception as e:
+        print(f"Failed to send support email: {e}")
+
+
+# Additional utility functions for user workspace management
+def get_user_projects_size(user_id: int) -> dict:
+    """Get total size of all projects for a user"""
+    base_path = Path(os.environ.get('UPLOAD_FOLDER', 'uploads'))
+    total_size = 0
+    project_sizes = {}
+
+    # Find all user workspaces
+    for workspace_dir in base_path.glob(f"workspace_u{user_id}_p*"):
+        if workspace_dir.is_dir():
+            project_id = workspace_dir.name.split('_p')[1]
+            project_size = 0
+
+            for root, dirs, files in os.walk(workspace_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    project_size += os.path.getsize(file_path)
+
+            project_sizes[project_id] = project_size
+            total_size += project_size
+
+    return {
+        'total_size': total_size,
+        'total_size_mb': round(total_size / (1024 * 1024), 2),
+        'projects': project_sizes
+    }
+
+
+def clean_user_project(user_id: int, project_id: int) -> bool:
+    """Clean up a specific user project workspace"""
+    try:
+        workspace = get_user_workspace_path(user_id, project_id)
+        if workspace.exists():
+            shutil.rmtree(workspace)
+            print(f"[engine] Cleaned workspace for user {user_id}, project {project_id}")
+            return True
+        return False
+    except Exception as e:
+        print(f"[engine] Error cleaning workspace: {e}")
+        return False
+
+
+def migrate_workspace_to_user_specific(old_workspace: Path, user_id: int, project_id: int) -> bool:
+    """Migrate an old workspace to user-specific structure"""
+    try:
+        new_workspace = get_user_workspace_path(user_id, project_id)
+
+        if old_workspace.exists() and not new_workspace.exists():
+            shutil.copytree(old_workspace, new_workspace)
+            print(f"[engine] Migrated workspace to user-specific: {new_workspace}")
+            return True
+        return False
+    except Exception as e:
+        print(f"[engine] Error migrating workspace: {e}")
+        return False
+
+
+# Export key functions and constants
+__all__ = [
+    'get_user_workspace_path',
+    'get_workspace_file',
+    'get_final_dir',
+    'language_options',
+    'SUPPORTED_TICKET_TYPES',
+    'output_settings',
+    'generate_voice_test',
+    'add_clip',
+    'list_clips',
+    'replace_clip',
+    'clear_clip_field',
+    'reorder_clips',
+    'get_voice_list',
+    'suggest_keywords',
+    'save_main_tab',
+    'save_script_and_regenerate',
+    'get_current_script',
+    'final_generate',
+    'generate_final_video',
+    'check_render_progress',
+    'final_video_path',
+    'upload_video',
+    'create_support_ticket',
+    'send_support_email',
+    'manifest_is_ready',
+    'get_user_projects_size',
+    'clean_user_project',
+    'migrate_workspace_to_user_specific',
+    '_load_manifest',
+    '_save_manifest',
+    '_empty_manifest',
+    '_update_status',
+    'LANDSCAPE_PLATFORMS',
+    'PORTRAIT_PLATFORMS',
+    'DEFAULT_VOICE',
+]
+
+# End of engine.py

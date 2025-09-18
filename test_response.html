@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Login</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f2f2f2;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 400px;
+      margin: 80px auto;
+      padding: 30px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+    }
+    h1 {
+      margin-bottom: 20px;
+      font-size: 24px;
+      color: #333;
+      text-align: center;
+    }
+    .flashes {
+      list-style: none;
+      padding: 0;
+      margin-bottom: 20px;
+    }
+    .flashes li {
+      padding: 10px;
+      border-radius: 4px;
+      margin-bottom: 10px;
+    }
+    .flashes li.error {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+    .flashes li.success {
+      background-color: #d4edda;
+      color: #155724;
+    }
+    form p {
+      margin-bottom: 15px;
+    }
+    label {
+      display: block;
+      font-weight: bold;
+      margin-bottom: 5px;
+      color: #555;
+    }
+    input[type="email"],
+    input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    .field-error {
+      color: #d9534f;
+      font-size: 0.9em;
+      margin-top: 4px;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background-color: #007bff;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .signup {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 0.95em;
+    }
+    .signup a {
+      color: #007bff;
+      text-decoration: none;
+    }
+    .signup a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Log In</h1>
+
+    
+      
+        <ul class="flashes">
+          
+            <li class="success">Script generated.</li>
+          
+            <li class="message">Please log in to access this page.</li>
+          
+        </ul>
+      
+    
+
+    <form method="post" action="/login">
+      <input id="csrf_token" name="csrf_token" type="hidden" value="Ijc4OWZiYTY0ZGE1MDRkNDg4YmQwMDdjNDEzMzA1ZTIyZjA0N2Y4MmEi.aLBwSg.qNouAZOqGt00o_zNVqjmCkFgYwg">
+
+      <p>
+        <label for="email">Email</label>
+        <input id="email" maxlength="120" name="email" required type="text" value="">
+        
+      </p>
+
+      <p>
+        <label for="password">Password</label>
+        <input id="password" minlength="6" name="password" required type="password" value="">
+        
+      </p>
+
+      <p>
+        <button type="submit">Log In</button>
+      </p>
+    </form>
+
+    <p class="signup">
+      Don’t have an account?
+      <a href="/signup">Sign up here</a>.
+    </p>
+  </div>
+</body>
+</html>

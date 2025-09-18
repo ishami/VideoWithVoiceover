@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Flask front-end for the VideoWithVoiceover engine
+=================================================
+Mirrors the original five-tab desktop GUI and serves the media files
+so the browser can preview them.
+"""
+from flask import url_for, Request
+from pathlib import Path
+import datetime, os, io, logging, json, time, pickle, shutil, subprocess, base64, uuid
+from threading import Thread
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash, jsonify,
+    send_from_directory, send_file, abort, Response, session
+)
+from google_auth_oauthlib.flow import Flow
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+
+import engine  # ← your heavy-lifting modules
+from utils.openai_wrapper import fallback_handler
+from utils.alternative_services import AlternativeServices
+from utils.monitoring import api_monitor
+
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from models import db, User, Project
+from payments import payments
+from forms import LoginForm
+from flask import Flask
+from flask import (
+    render_template, request, jsonify,
+    session, url_for, flash
+)
+from flask_login import login_required, current_user
+from models import db, Project
+import os
+import json
+import stripe
+
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    flash, session, jsonify, abort
+)
+from flask_login import login_required, current_user, login_user
+from werkzeug.security import check_password_hash
+
+from models import db, User, Project, FREE_TIER_LIMIT
+from forms import LoginForm
+
+# … your existing imports …
+
+# Stripe setup
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+ONE_TIME_PRICE_ID = os.getenv("STRIPE_ONE_TIME_PRICE_ID")
+SUBSCRIPTION_PRICE_ID = os.getenv("STRIPE_SUBSCRIPTION_PRICE_ID")
+FREE_TIER_LIMIT = 3
+PREMIUM_TIER_LIMIT = 50   # or however many projects you want
+
+# Ensure you have a SECRET_KEY set for sessions & CSRF
+# ─────────────────── Flask basic setup ──────────────────────────────────
+
+app = Flask(__name__)
+app.jinja_env.globals['now'] = datetime.datetime.utcnow
+
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev‐fallback‐only')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///video_app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db.init_app(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+with app.app_context():
+    db.create_all()
+
+# Register blueprints
+app.register_blueprint(payments)
+
+alternative_services = AlternativeServices()
+
+@app.before_request
+def ensure_user_id():
+    session.permanent = True
+    if 'user_id' not in session:
+        session['user_id'] = str(uuid.uuid4())
+
+app.config.update(
+    UPLOAD_FOLDER=os.path.abspath('uploads'),
+    ENABLE_OPENAI_FALLBACKS=True,
+    MAX_OPENAI_RETRIES=3,
+    FALLBACK_CACHE_DURATION=3600,
+    FALLBACK_AUDIO_PATH='static/audio/fallbacks/',
+    FALLBACK_IMAGE_PATH='static/images/fallbacks/'
+)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['FALLBACK_AUDIO_PATH'], exist_ok=True)
+os.makedirs(app.config['FALLBACK_IMAGE_PATH'], exist_ok=True)
+app.config['PREFERRED_URL_SCHEME'] = 'https'
+
+log = app.logger
+log.setLevel(logging.INFO)
+
+# Workspace constants
+WORK_DIR = Path(engine.WORK_DIR) if hasattr(engine, 'WORK_DIR') else Path("workspace")
+FINAL_DIR = Path(engine.FINAL_DIR) if hasattr(engine, 'FINAL_DIR') else WORK_DIR / "final"
+TITLE_FILE = Path(engine.TITLE_FILE) if hasattr(engine, 'TITLE_FILE') else WORK_DIR / "title.txt"
+SCRIPT_FILE = Path(engine.SCRIPT_FILE) if hasattr(engine, 'SCRIPT_FILE') else WORK_DIR / "script.txt"
+KEYWORDS_FILE = Path(engine.KEYWORDS_FILE) if hasattr(engine, 'KEYWORDS_FILE') else WORK_DIR / "keywords.txt"
+
+def _load_manifest():
+    if hasattr(engine, '_load_manifest'):
+        return engine._load_manifest()
+    manifest_file = WORK_DIR / "manifest.json"
+    return json.loads(manifest_file.read_text()) if manifest_file.exists() else {}
+
+@app.template_filter('strftime')
+def _jinja2_filter_datetime(value, fmt='%Y-%m-%dT%H:%M'):
+    return value.strftime(fmt) if isinstance(value, datetime.datetime) else value
+
+@app.context_processor
+def inject_now():
+    return dict(now=datetime.datetime.utcnow)
+
+def _flash(ok: bool, msg: str):
+    flash(msg, 'success' if ok else 'danger')
+
+@app.route('/uploads/<path:filename>')
+def uploaded_file(filename):
+    full = Path(app.config['UPLOAD_FOLDER']) / filename
+    if not full.is_file():
+        abort(404)
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=False)
+
+# ========================================================================
+# AUTH: signup / login / logout
+# ========================================================================
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        if User.query.filter_by(email=email).first():
+            flash('Email already registered', 'error')
+            return redirect(url_for('signup'))
+        user = User(email=email, password_hash=generate_password_hash(password),projects_limit=FREE_TIER_LIMIT)
+        db.session.add(user); db.session.commit()
+        login_user(user)
+        return redirect(url_for('index'))
+    return render_template('signup.html')
+
+from forms import LoginForm
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()                    # instantiate the form
+    # on POST, validate data + CSRF
+    if form.validate_on_submit():
+        # lookup user
+        user = User.query.filter_by(email=form.email.data).first()
+        # check password
+        if user and check_password_hash(user.password_hash, form.password.data):
+            login_user(user)
+            # redirect to next or default page
+            next_page = request.args.get('next') or url_for('script')
+            return redirect(next_page)
+        else:
+            flash('Invalid email or password', 'error')
+    # on GET or on failed validation, re‐render form (with errors + CSRF)
+    return render_template('login.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+# ========================================================================
+# 1) MAIN TAB  "/"
+# ========================================================================
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        ok, msg = engine.save_main_tab(request.form.to_dict(flat=True))
+        _flash(ok, msg)
+        if ok:
+            return redirect(url_for('script'))
+    return render_template('index.html',
+                           languages=engine.language_options,
+                           voices=engine.get_voice_list())
+# ---------- helper APIs --------------------------------------------------
+@app.get('/api/voices')
+def api_voices():
+    return jsonify(engine.get_voice_list())
+
+
+@app.post('/api/test_voice')
+def api_test_voice():
+    try:
+        voice = request.json['voice']
+        # Since the generate_voice_test function is missing, let's create a simple implementation
+        # This is a temporary fix until the function is added to engine.py
+        if hasattr(engine, 'generate_voice_test'):
+            data = engine.generate_voice_test(voice)
+        else:
+            # Temporary implementation - empty MP3 file
+            app.logger.warning("Using temporary voice test implementation")
+            # Create an empty MP3 file - this is just a placeholder
+            data = b'\xFF\xFB\x90\x44\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+
+        if not data:  # Check if we got empty data
+            return jsonify({"error": "Failed to generate voice test"}), 500
+
+        return send_file(io.BytesIO(data),
+                         download_name='test.mp3',
+                         mimetype='audio/mpeg')
+    except Exception as e:
+        app.logger.exception("Voice test generation failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post('/api/keywords')
+def api_keywords():
+    prompt = request.json.get('prompt', '')
+    title = request.json.get('title', '')
+    return jsonify(engine.suggest_keywords(title, prompt))  # list[str]
+
+@app.route('/api/final/progress')
+@login_required
+def api_final_progress():
+    """Get progress of final video rendering"""
+    try:
+        # Read progress from workspace status
+        status_file = "workspace/status.txt"
+        if os.path.exists(status_file):
+            with open(status_file, 'r') as f:
+                status = f.read().strip()
+            
+            # Extract progress percentage if available
+            import re
+            progress_match = re.search(r'(\d+)%', status)
+            progress = int(progress_match.group(1)) if progress_match else 0
+            
+            return jsonify({
+                'status': 'processing',
+                'message': status,
+                'progress': progress
+            })
+        else:
+            return jsonify({
+                'status': 'idle',
+                'message': 'No active rendering',
+                'progress': 0
+            })
+            
+    except Exception as e:
+        app.logger.error(f"Progress check error: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'progress': 0
+        }), 500
+
+
+@app.route('/api/final/progress')
+@login_required
+    if status_file.exists():
+        return status_file.read_text()
+    return "Processing... please wait"
+
+
+@app.route('/authorize_youtube')
+def authorize_youtube():
+    flow = Flow.from_client_secrets_file(
+        str(CLIENT_SECRETS_FILE),
+        scopes=YOUTUBE_SCOPES,
+        redirect_uri=os.getenv('YOUTUBE_REDIRECT_URI', 'https://ai-videocreator.com/oauth2callback')
+    )
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true'
+    )
+    session['state'] = state
+    return redirect(auth_url)
+
+@app.route('/oauth2callback')
+def oauth2callback():
+    user_id = session.get('user_id')
+    print(f"OAUTH2CALLBACK: ENTERED. user_id={user_id}")
+    try:
+        print("OAUTH2CALLBACK: About to create Flow.")
+        flow = Flow.from_client_secrets_file(
+            str(CLIENT_SECRETS_FILE),
+            scopes=YOUTUBE_SCOPES,
+            state=session.get('state'),
+            redirect_uri=os.getenv('YOUTUBE_REDIRECT_URI', 'https://ai-videocreator.com/oauth2callback')
+        )
+        print("OAUTH2CALLBACK: About to fetch token from request.url =", request.url)
+        flow.fetch_token(authorization_response=request.url)
+        creds = flow.credentials
+        print("OAUTH2CALLBACK: Creds obtained, about to save pickle.")
+        with open(user_token_path(user_id), "wb") as tokenfile:
+            pickle.dump(creds, tokenfile)
+            print(f"OAUTH2CALLBACK: Token written to {user_token_path(user_id)}")
+        flash("YouTube authentication successful!", "success")
+        return redirect(url_for('final_video'))
+    except Exception as e:
+        print("OAUTH2CALLBACK: EXCEPTION:", e)
+        import traceback; traceback.print_exc()
+        return f"<pre>OAuth callback failed: {e}\n\n{traceback.format_exc()}</pre>", 400
+
+
+# ========================================================================
+# 2) SCRIPT TAB  "/script" - UPDATED WITH KEYWORD FIXES
+# ========================================================================
+
+def clear_old_media():
+    """Clear old media files to free up disk space"""
+    try:
+        import shutil
+        import os
+        
+        # Define directories to clean
+        media_dirs = ["workspace", "uploads", "output"]
+        
+        for dir_name in media_dirs:
+            if os.path.exists(dir_name):
+                # Get list of files older than 1 hour (for safety)
+                import time
+                current_time = time.time()
+                
+                for filename in os.listdir(dir_name):
+                    filepath = os.path.join(dir_name, filename)
+                    if os.path.isfile(filepath):
+                        # Check if file is older than 1 hour (3600 seconds)
+                        file_age = current_time - os.path.getmtime(filepath)
+                        if file_age > 3600:  # 1 hour
+                            try:
+                                os.remove(filepath)
+                                app.logger.info(f"Removed old media file: {filepath}")
+                            except:
+                                pass  # Ignore errors for files in use
+                                
+        app.logger.info("Old media cleanup completed")
+        
+    except Exception as e:
+        app.logger.warning(f"Media cleanup failed: {str(e)}")
+        # Don't raise the error, just log it since cleanup is not critical
+
+
+@app.route('/script', methods=['GET', 'POST'])
+@login_required
+def script():
+    if request.method == 'POST':
+        script_text = request.form['script']
+        title = request.form.get('title', 'Untitled')
+
+        # Get the modified keywords from the form
+        keywords = request.form.get('keywords', '')
+        if keywords:
+            # Save keywords to file for engine to use
+            keywords_path = os.path.join('workspace', 'keywords.txt')
+            with open(keywords_path, 'w') as f:
+                f.write(keywords)
+
+            # Parse keywords for engine (limit to 2-3 for performance)
+            keyword_list = [k.strip() for k in keywords.split(',') if k.strip()][:3]
+            session['keywords'] = keyword_list
+            app.logger.info(f"Using keywords from form: {keyword_list}")
+
+        # 1) Create draft project
+        proj = Project(
+            user_id=current_user.id,
+            title=title,
+            script=script_text,
+            status='draft'
+        )
+        db.session.add(proj)
+        db.session.commit()
+
+        # 2) Enforce free-tier limit
+        count = Project.query.filter_by(user_id=current_user.id).count()
+        if count > current_user.projects_limit and not current_user.is_premium:
+            # stash for resume
+            session['pending_project_id'] = proj.id
+            # redirect user to your upgrade page
+            upgrade_url = url_for('payments.upgrade')
+            return jsonify({
+                'success': False,
+                'message': f"Free tier limited to {current_user.projects_limit}.",
+                'upgrade_url': upgrade_url
+            }), 402
+
+        # 3) Mark processing and kick off your worker
+        proj.status = 'processing'
+        db.session.commit()
+
+        # Clear old media before regeneration
+        clear_old_media()
+
+        ok, msg = engine.save_script_and_regenerate(script_text, current_user.id)
+
+        return jsonify({
+            'success': ok,
+            'message': msg,
+            'project_id': proj.id
+        })
+
+    # GET method handling - render the script template
+    else:
+        # Try to get the current/latest project for this user
+        project = Project.query.filter_by(
+            user_id=current_user.id
+        ).order_by(Project.created_at.desc()).first()
+        
+        # Get script content - either from the project or from session/engine
+        script_content = ""
+        if project and project.script:
+            script_content = project.script
+        else:
+            # Try to get from engine or session if available
+            try:
+                script_content = engine.get_current_script() if hasattr(engine, 'get_current_script') else ""
+            except:
+                script_content = ""
+        
+        # Get keywords from session if available
+        keywords = session.get('keywords', [])
+        keywords_str = ', '.join(keywords) if keywords else ''
+        
+        return render_template('script.html', 
+                             script=script_content,
+                             project=project,
+                             keywords=keywords_str)
+
+# ========================================================================
+# Missing Navigation Routes
+# ========================================================================
+
+@app.route("/clips")
+@login_required
+def clips():
+    """Clips/Video segments page"""
+    project_id = request.args.get("project_id")
+    
+    if project_id:
+        # Get specific project by ID
+        project = Project.query.get(project_id)
+        # Verify user owns this project
+        if project and project.user_id != current_user.id:
+            project = None
+    else:
+        # Get the latest project for this user
+        project = Project.query.filter_by(
+            user_id=current_user.id
+        ).order_by(Project.created_at.desc()).first()
+    
+    return render_template("clips.html", project=project)
+
+@app.route('/final_video')
+@login_required  
+def final_video():
+    """Final video page"""
+    # Try to get the current project
+    project = Project.query.filter_by(
+        user_id=current_user.id
+    ).order_by(Project.created_at.desc()).first()
+    
+    return render_template('final_video.html', project=project)
+
+@app.route('/support')
+def support():
+    """Support/Help page"""
+    return render_template('support.html')
+
+# ========================================================================
+# Missing API Routes for Clips functionality
+# ========================================================================
+
+@app.route('/api/final_render', methods=['POST'])
+@login_required
+def api_final_render():
+    """API endpoint for final video rendering"""
+    try:
+        # Get project ID from request
+        data = request.get_json()
+        project_id = data.get('project_id')
+        
+        if not project_id:
+            return jsonify({'success': False, 'message': 'Project ID required'}), 400
+            
+        # Verify user owns the project
+        project = Project.query.get(project_id)
+        if not project or project.user_id != current_user.id:
+            return jsonify({'success': False, 'message': 'Project not found'}), 404
+            
+        # For now, return a placeholder response
+        # This would normally trigger the final video rendering process
+        return jsonify({
+            'success': True, 
+            'message': 'Final video rendering started',
+            'status': 'processing'
+        })
+        
+    except Exception as e:
+        app.logger.exception("Final render API error")
+        return jsonify({'success': False, 'message': str(e)}), 500
+

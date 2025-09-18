@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}My Projects{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>My Projects</h2>
+    
+    {% if projects %}
+        <div class="row">
+            {% for project in projects %}
+            <div class="col-md-4 mb-3">
+                <div class="card">
+                    <div class="card-body">
+                        <h5 class="card-title">{{ project.title }}</h5>
+                        <p class="card-text">
+                            Created: {{ project.created_at.strftime('%Y-%m-%d %H:%M') }}<br>
+                            Status: {{ project.status }}
+                        </p>
+                        <a href="{{ url_for('script', project_id=project.id) }}" class="btn btn-primary">Open Project</a>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p>No projects found. <a href="{{ url_for('index') }}">Create your first project</a></p>
+    {% endif %}
+</div>
+{% endblock %}

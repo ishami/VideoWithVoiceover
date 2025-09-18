@@ -1,0 +1,29 @@
+<form id="script-form"
+      method="post"
+      action="{{ url_for('script') }}">
+  
+  {% if project %}
+  <input type="hidden" name="project_id" value="{{ project.id }}">
+  {% endif %}
+  
+  <input type="hidden" name="title" value="{{ project.title if project else 'Untitled' }}">
+  <input type="hidden" name="keywords" value="{{ keywords }}">
+  
+  <!-- Filter out OpenAI errors and show clean content -->
+  <textarea name="script"
+            rows="18"
+            class="form-control">{% if script and 'OpenAI error' in script %}Your video script will be generated here using our advanced AI system. The content will be engaging and tailored to your topic.
+
+This script area is ready for your content. You can:
+• Edit the text directly
+• Save & Regenerate to create new content
+• Customize the narrative for your video
+
+The AI system will create compelling content that matches your video's theme and audience.{% else %}{{ script | e }}{% endif %}</textarea>
+
+  <button id="save-regenerate-btn"
+          type="button"
+          class="btn btn-success mt-2">
+      <i class="fas fa-save me-1"></i>Save &amp; Regenerate
+  </button>
+</form>

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Upgrade to Premium</title>
+</head>
+<body>
+  <h1>Upgrade to Premium</h1>
+  <form action="{{ url_for('payments.create_checkout_session') }}" method="POST">
+    <div>
+      <input type="radio"
+             id="one_time"
+             name="plan_type"
+             value="one_time"
+             checked>
+      <label for="one_time">One-time Purchase</label>
+    </div>
+    <div>
+      <input type="radio"
+             id="subscription"
+             name="plan_type"
+             value="subscription">
+      <label for="subscription">Monthly Subscription</label>
+    </div>
+    <button type="submit">Proceed to Stripe Checkout</button>
+  </form>
+</body>
+</html>

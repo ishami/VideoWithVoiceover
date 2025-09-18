@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Review / Edit Script</h2>
+
+<form id="script-form" method="post" action="{{ url_for('script') }}">
+  {% if project %}
+    <input type="hidden" name="project_id" value="{{ project.id }}">
+  {% endif %}
+
+  <div class="form-group">
+    <label for="script_text">Script</label>
+    <textarea id="script_text" name="script_text" class="form-control" rows="15">{{ script }}</textarea>
+  </div>
+
+  <button type="submit" class="btn btn-primary">Save</button>
+  <button type="submit" name="save-regenerate" value="1" class="btn btn-warning">Save &amp; Regenerate</button>
+</form>
+
+<hr>
+
+<h3>Keywords</h3>
+<pre>{{ keywords }}</pre>
+
+<hr>
+
+<div id="clips-list">
+  {% if clips_data.media_clips %}
+    <h3>Media Clips</h3>
+    <ul>
+      {% set seen_media = [] %}
+      {% for clip in clips_data.media_clips %}
+        {% if clip not in seen_media %}
+          <li>
+            <a href="{{ url_for('serve_clip', user_id=current_user.id, project_id=project.id, filename=clip|basename) }}" target="_blank">
+              {{ clip|basename }}
+            </a>
+          </li>
+          {% set _ = seen_media.append(clip) %}
+        {% endif %}
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  {% if clips_data.music_clips %}
+    <h3>Music Clips</h3>
+    <ul>
+      {% set seen_music = [] %}
+      {% for clip in clips_data.music_clips %}
+        {% if clip not in seen_music %}
+          <li>
+            <a href="{{ url_for('serve_clip', user_id=current_user.id, project_id=project.id, filename=clip|basename) }}" target="_blank">
+              {{ clip|basename }}
+            </a>
+          </li>
+          {% set _ = seen_music.append(clip) %}
+        {% endif %}
+      {% endfor %}
+    </ul>
+  {% endif %}
+</div>
+
+<script>
+  // Auto-refresh clips every 10s
+  setInterval(function() {
+    fetch("{{ url_for('api_clips_data', project_id=project.id) }}")
+      .then(res => res.json())
+      .then(data => {
+        if (data.media_clips || data.music_clips) {
+          console.log("✅ Refreshed clips:", data);
+        }
+      });
+  }, 10000);
+</script>
+{% endblock %}

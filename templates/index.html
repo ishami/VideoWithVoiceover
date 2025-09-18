@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+
+{# --------------------------------------------------------------------
+   <head> additions
+   -------------------------------------------------------------------- #}
+{% block extra_head %}
+  <style>
+    /* make the textarea inside the modal taller by default */
+    .modal textarea { min-height:120px }
+  </style>
+{% endblock %}
+
+{# --------------------------------------------------------------------
+   Main content
+   -------------------------------------------------------------------- #}
+{% block content %}
+<h2>Main – Video Generator</h2>
+
+<form id="mainForm" method="post" class="needs-validation" novalidate>
+
+  <div class="mb-3" style="display:none;">
+  <label class="form-label">Target language *</label>
+  <select name="target_language" required>
+    <option value="en" selected>English</option>
+  </select>
+</div>
+
+  <!-- Voice selector --------------------------------------------------->
+  <div class="mb-3">
+    <label class="form-label">Voice *</label>
+    <div class="input-group">
+      <select id="voiceSelect" name="voice" class="form-select" required>
+        <!-- options filled by JS -->
+      </select>
+      <button type="button" class="btn btn-secondary" id="testVoice">
+        Test voice
+      </button>
+    </div>
+  </div>
+
+  <!-- Platform --------------------------------------------------------->
+  <div class="mb-3">
+    <label class="form-label">Platform *</label>
+    <select name="platform" class="form-select" required>
+      {% for p in ["YouTube", "YouTube Shorts", "Facebook", "Instagram", "TikTok"] %}
+        <option value="{{ p }}">{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Instrumental genre ---------------------------------------------->
+  <div class="mb-3">
+    <label class="form-label">Instrumental genre *</label>
+    <select name="genre" class="form-select" required>
+      {% for g in ['Ambient','Classical','Electronic','Folk','Jazz','Lo-fi',
+                   'New Age','Post-Rock','Soundtrack','World Music'] %}
+        <option value="{{ g }}"{% if g == 'Soundtrack' %} selected{% endif %}>
+          {{ g }}
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Modify keywords radio ------------------------------------------->
+  <div class="mb-3">
+    <label class="form-label">Modify keywords?</label><br>
+    <div class="form-check form-check-inline">
+      <input class="form-check-input" type="radio"
+             name="modify_kw" value="yes" checked>
+      <label class="form-check-label">Yes</label>
+    </div>
+    <div class="form-check form-check-inline">
+      <input class="form-check-input" type="radio"
+             name="modify_kw" value="no">
+      <label class="form-check-label">No</label>
+    </div>
+  </div>
+
+  <!-- Bypass voice-over / subtitles ----------------------------------->
+  <div class="mb-3">
+    <label class="form-label">By-pass voice-over &amp; subtitles?</label><br>
+    <div class="form-check form-check-inline">
+      <input class="form-check-input" type="radio"
+             name="bypass" value="yes">
+      <label class="form-check-label">Yes</label>
+    </div>
+    <div class="form-check form-check-inline">
+      <input class="form-check-input" type="radio"
+             name="bypass" value="no" checked>
+      <label class="form-check-label">No</label>
+    </div>
+  </div>
+
+  <!-- Video title ------------------------------------------------------>
+  <div class="mb-3">
+    <label class="form-label">Video title *</label>
+    <input class="form-control" name="video_title" required>
+  </div>
+
+  <!-- Prompt / Script -------------------------------------------------->
+  <div class="mb-3">
+    <label class="form-label">Prompt / Script *</label>
+    <textarea class="form-control" rows="4"
+              name="script" required></textarea>
+  </div>
+
+  <!-- Hidden field that will receive the (possibly edited) keywords --->
+  <input type="hidden" name="keywords" id="kwHidden">
+
+  <!-- Submit ----------------------------------------------------------->
+  <button type="button" class="btn btn-primary" id="startBtn">
+    Start Video Creation
+  </button>
+</form>
+
+{# ---------- Keyword-editing modal (Bootstrap) ---------- #}
+<div class="modal fade" id="kwModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Review / edit keywords</h5>
+        <button type="button" class="btn-close"
+                data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+
+      <div class="modal-body">
+        <p class="small text-muted">Separate keywords with commas.</p>
+        <textarea id="kwTextarea" class="form-control"></textarea>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary"
+                data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="kwContinue">
+          Continue → Generate script
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{# --------------------------------------------------------------------
+   JavaScript
+   -------------------------------------------------------------------- #}
+{% block extra_js %}
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+
+  <!-- Override form submission to handle redirect properly -->
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      // Override the keyword continue button handler
+      const kwContinue = document.getElementById('kwContinue');
+      const kwModal = document.getElementById('kwModal');
+      const kwTextarea = document.getElementById('kwTextarea');
+      const kwHidden = document.getElementById('kwHidden');
+      const mainForm = document.getElementById('mainForm');
+
+      if (kwContinue && kwModal) {
+        kwContinue.addEventListener('click', function(e) {
+          e.preventDefault();
+
+          // Get keywords from textarea
+          const keywords = kwTextarea.value.trim();
+          kwHidden.value = keywords;
+
+          // Hide modal
+          const modal = bootstrap.Modal.getInstance(kwModal);
+          if (modal) modal.hide();
+
+          // Show loading state
+          const startBtn = document.getElementById('startBtn');
+          const originalText = startBtn.innerHTML;
+          startBtn.disabled = true;
+          startBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Processing...';
+
+          // Submit form via AJAX
+          const formData = new FormData(mainForm);
+
+          fetch('/', {
+            method: 'POST',
+            body: formData,
+            headers: {
+              'X-Requested-With': 'XMLHttpRequest'
+            }
+          })
+          .then(response => {
+            if (response.redirected) {
+              // Follow the redirect
+              window.location.href = response.url;
+            } else if (response.ok) {
+              // If no redirect, manually go to script page
+              // This handles the case where the response is JSON or plain text
+              return response.text().then(text => {
+                // Try to parse as JSON first
+                try {
+                  const data = JSON.parse(text);
+                  if (data.project_id) {
+                    window.location.href = `/script?project_id=${data.project_id}`;
+                  } else {
+                    window.location.href = '/script';
+                  }
+                } catch {
+                  // Not JSON, assume success and redirect
+                  window.location.href = '/script';
+                }
+              });
+            } else {
+              // Error occurred
+              throw new Error('Form submission failed');
+            }
+          })
+          .catch(error => {
+            console.error('Error:', error);
+            alert('An error occurred. Please try again.');
+            // Restore button
+            startBtn.disabled = false;
+            startBtn.innerHTML = originalText;
+          });
+        });
+      }
+    });
+  </script>
+{% endblock %}

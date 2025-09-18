@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Video Creator</title>
+
+  <!-- Bootstrap core CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+        rel="stylesheet">
+
+  <!-- bootstrap-select CSS (lets <select> show images) -->
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-select/1.14.0-beta3/css/bootstrap-select.min.css">
+
+  <!-- your custom stylesheet -->
+  <link rel="stylesheet"
+        href="{{ url_for('static', filename='css/style.css') }}">
+
+  {% block extra_head %}{% endblock %}
+
+  <!-- Make login/upgrade URLs available to all JS modules -->
+  <script type="text/javascript">
+    window.LOGIN_URL   = "{{ url_for('login') }}";
+    window.UPGRADE_URL = "{{ url_for('payments.upgrade') }}";
+  </script>
+</head>
+<body class="container py-3">
+
+<nav class="nav nav-tabs mb-3">
+  <a class="nav-link {{ 'active' if request.path == '/' else '' }}"
+     href="{{ url_for('index') }}">Input</a>
+  <a class="nav-link {{ 'active' if request.path.startswith('/script') else '' }}"
+     href="{{ url_for('script') }}">Script</a>
+  <a class="nav-link {{ 'active' if request.path.startswith('/clips') else '' }}"
+     id="nav-clips-tab"
+     href="{{ url_for('clips') }}">Clips</a>
+  <a class="nav-link {{ 'active' if request.path.startswith('/final') else '' }}"
+     href="{{ url_for('final_video') }}">Final Video</a>
+  <a class="nav-link {{ 'active' if request.path.startswith('/support') else '' }}"
+     href="{{ url_for('support') }}">Support</a>
+</nav>
+
+{% with msgs = get_flashed_messages(with_categories=true) %}
+  {% if msgs %}
+    {% for cat, msg in msgs %}
+      <div class="alert alert-{{ cat }}">{{ msg }}</div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+{% block content %}{% endblock %}
+
+<!-- jQuery (required for bootstrap-select) -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<!-- Bootstrap core JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<!-- bootstrap-select JS -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-select/1.14.0-beta3/js/bootstrap-select.min.js"></script>
+
+<script> $(function () { $('.selectpicker').selectpicker(); }); </script>
+
+<!-- GLOBAL APP LOGIC -->
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+
+{% block extra_js %}{% endblock %}
+
+<script>
+/* Show banner + poll until the back-end says “manifest ready” */
+function startDownloadPolling() {
+  const banner = document.createElement('div');
+  banner.id = 'regen-banner';
+  banner.style.cssText =
+    'position:fixed;top:0;left:0;right:0;padding:10px;' +
+    'background:#ffd;font-weight:bold;text-align:center;z-index:9999';
+  banner.textContent =
+    'Downloading content – please wait … You will be switched to Clips once finished.';
+  document.body.appendChild(banner);
+
+  const tid = setInterval(() => {
+    fetch('/api/regen_ready', { headers: { 'Accept': 'application/json' } })
+    .then(r => r.json())
+    .then(j => {
+      if (j.ready) {
+        clearInterval(tid);
+        location.href = '/clips?project_id=' + (window.currentProjectId || sessionStorage.getItem('project_id') || '');
+      }
+    });
+  }, 3000);
+}
+
+document.getElementById('save-regenerate-btn').addEventListener('click', e => {
+  e.preventDefault();
+  const form = document.getElementById('script-form');
+  fetch(form.action, {
+    method: 'POST',
+    headers: { 'Accept': 'application/json' },
+    body: new FormData(form)
+  })
+  .then(r => r.json())
+  .then(j => {
+    if (j.success) startDownloadPolling();
+    else alert('Error: ' + j.message);
+  });
+});
+</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const voiceSelect = document.getElementById('voiceSelect');
+  if (!voiceSelect) return;
+
+  const observer = new MutationObserver(function() {
+    if (voiceSelect.options.length > 0) {
+      let defaultFound = false;
+      for (let i = 0; i < voiceSelect.options.length; i++) {
+        if (voiceSelect.options[i].text === 'en-US-AvaMultilingualNeural') {
+          voiceSelect.selectedIndex = i;
+          defaultFound = true;
+          console.log('Default voice set to en-US-AvaMultilingualNeural');
+          break;
+        }
+      }
+      if (!defaultFound) {
+        console.warn('Default voice "en-US-AvaMultilingualNeural" not found in options');
+      }
+      observer.disconnect();
+    }
+  });
+
+  observer.observe(voiceSelect, { childList: true });
+});
+</script>
+
+{% include 'error_modal.html' %}
+</body>
+</html>

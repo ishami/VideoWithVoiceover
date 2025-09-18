@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+
+{% block extra_head %}
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+
+<style>
+#clipTable td, #clipTable th { white-space: nowrap; vertical-align: middle; }
+#clipTable td.text-end { padding-right: .6rem; }
+#clipTable th.fname, #clipTable td.fname { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+#clipTable th.subtext, #clipTable td.subtext { max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+
+#clipTable .preview { width: 120px; text-align: center; }
+#clipTable .preview img { max-width: 110px; max-height: 70px; object-fit: cover; cursor: pointer; }
+#clipTable .preview i { font-size: 2em; cursor: pointer; }
+
+.media-handle i, .music-handle i { cursor: grab; color: #777; }
+
+#clipTable .preview i.fa-play-circle { color: #007bff; }
+#clipTable .preview i.fa-play-circle:hover { color: #0056b3; }
+#clipTable .preview i.fa-music { color: #28a745; }
+#clipTable .preview i.fa-music:hover { color: #1e7e34; }
+
+#clipTable .preview img[src=""], #clipTable .preview img:not([src]) { display: none; }
+.fa-music.text-danger { animation: pulse 1s infinite; }
+
+@keyframes pulse { 0% {opacity:1} 50% {opacity:0.6} 100% {opacity:1} }
+
+.clip-thumb, .clip-play { cursor: pointer; transition: transform 0.2s; }
+.clip-thumb:hover, .clip-play:hover { transform: scale(1.1); }
+
+#previewModal video { max-width: 100%; max-height: 70vh; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2>Clips &amp; Subtitles</h2>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    <div>
+      {% for category, msg in messages %}
+        <div class="alert alert-{{ 'info' if category=='info' else category }}">{{ msg }}</div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endwith %}
+
+<div class="mb-2">
+    <button class="btn btn-danger btn-sm me-2" id="delBtn" disabled><i class="fas fa-trash"></i> Delete selected</button>
+    <button class="btn btn-secondary btn-sm me-3" id="replaceBtn" disabled><i class="fas fa-arrows-rotate"></i> Replace…</button>
+    <button class="btn btn-primary btn-sm" id="genBtn" data-busy-block><i class="fas fa-film"></i> Generate final video</button>
+    <input type="file" id="replaceFile" hidden accept="video/*,image/*,audio/*">
+</div>
+
+<!-- Small progress bar -->
+<div class="progress mb-3 d-none" id="genBarWrap" style="height:.8rem;">
+    <div class="progress-bar progress-bar-striped progress-bar-animated" id="genBar" style="width:0%"></div>
+</div>
+
+<!-- Large progress container -->
+<div id="progress-container" class="text-center my-4" style="display: none;">
+    <div class="progress mb-3" style="height: 30px;">
+        <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: 0%">0%</div>
+    </div>
+    <div id="status-message" class="alert alert-info"><i class="fas fa-spinner fa-spin me-2"></i>Starting processing...</div>
+</div>
+
+<div id="clips-table">
+    <table id="clipTable" class="table table-bordered table-sm align-middle">
+        <thead class="table-light small">
+            <tr>
+                <th rowspan="2" class="text-center"><input type="checkbox" id="mediaAll"></th>
+                <th rowspan="2" class="text-center"></th>
+                <th colspan="6"  class="text-center">Media</th>
+                <th rowspan="2" class="text-center"></th>
+                <th rowspan="2" class="text-center"><input type="checkbox" id="musicAll"></th>
+                <th colspan="5"  class="text-center">Music</th>
+                <th colspan="3"  class="text-center">Subtitle</th>
+            </tr>
+            <tr>
+                <th class="preview">Prev.</th>
+                <th>Type</th>
+                <th class="fname">File</th>
+                <th class="text-end">Dur.</th>
+                <th class="text-end">Start</th>
+                <th class="text-end">End</th>
+                <th class="preview">Prev.</th>
+                <th class="fname">File</th>
+                <th class="text-end">Dur.</th>
+                <th class="text-end">Start</th>
+                <th class="text-end">End</th>
+                <th class="subtext">Text</th>
+                <th class="text-end">Start</th>
+                <th class="text-end">End</th>
+            </tr>
+        </thead>
+        <tbody id="clipBody">
+        {% set max_rows = [media_clips|length, music_clips|length, subtitles|length]|max %}
+        {% if max_rows > 0 %}
+            {% for i in range(max_rows) %}
+                {% set media = media_clips[i] if i < media_clips|length else None %}
+                {% set music = music_clips[i] if i < music_clips|length else None %}
+                {% set subtitle = subtitles[i] if i < subtitles|length else None %}
+                <tr data-id="{{ i + 1 }}">
+                    <td class="text-center">
+                        {% if media %}
+                            <input type="checkbox" class="mediaChk">
+                        {% else %}
+                            <button class="btn btn-sm btn-outline-primary add-media" data-row="{{ i + 1 }}"><i class="fas fa-plus"></i></button>
+                        {% endif %}
+                    </td>
+                    <td class="text-center"><span class="media-handle" title="re-order media"><i class="fas fa-grip-lines fa-lg"></i></span></td>
+                    <td class="preview">
+                        {% if media %}
+                            {% if media.is_image %}
+                                <img class="clip-thumb" src="{{ media.url }}" data-src="{{ media.url }}" alt="" onerror="this.style.display='none'; this.nextElementSibling.style.display='inline';">
+                                <i class="fas fa-image" style="display:none; color:#6c757d;" title="Image file"></i>
+                            {% elif media.is_video %}
+                                <i class="fas fa-play-circle clip-play" data-src="{{ media.url }}" title="Video file"></i>
+                            {% else %}
+                                <i class="fas fa-file clip-play" data-src="{{ media.url }}" title="Media file"></i>
+                            {% endif %}
+                        {% else %} — {% endif %}
+                    </td>
+                    <td>
+                        {% if media %}
+                            {% if media.is_image %}
+                                Image
+                            {% elif media.is_video %}
+                                Video
+                            {% else %}
+                                Media
+                            {% endif %}
+                        {% endif %}
+                    </td>
+                    <td class="fname" title="{{ media.filename if media else '' }}">{{ media.filename if media else '' }}</td>
+                    <td class="text-end">{{ media.duration|default('')|string and format_time(media.duration) }}</td>
+                    <td class="text-end">{{ media.start_time is defined and format_time(media.start_time) }}</td>
+                    <td class="text-end">{{ media.end_time is defined and format_time(media.end_time) }}</td>
+                    <td class="text-center"><span class="music-handle" title="re-order music"><i class="fas fa-grip-lines fa-lg"></i></span></td>
+                    <td class="text-center">
+                        {% if music %}
+                            <input type="checkbox" class="musicChk">
+                        {% else %}
+                            <button class="btn btn-sm btn-outline-primary add-music" data-row="{{ i + 1 }}"><i class="fas fa-plus"></i></button>
+                        {% endif %}
+                    </td>
+                    <td class="preview">{% if music %}<i class="fas fa-music clip-play" data-src="{{ music.url }}" title="Music file"></i>{% else %} — {% endif %}</td>
+                    <td class="fname" title="{{ music.filename if music else '' }}">{{ music.filename if music else '' }}</td>
+                    <td class="text-end">{{ music.duration|default('')|string and format_time(music.duration) }}</td>
+                    <td class="text-end">{{ music.start_time is defined and format_time(music.start_time) }}</td>
+                    <td class="text-end">{{ music.end_time is defined and format_time(music.end_time) }}</td>
+                    <td class="subtext" title="{{ subtitle[2] if subtitle else '' }}">{{ subtitle[2] if subtitle else '' }}</td>
+                    <td class="text-end">{{ subtitle and format_time(subtitle[0]) }}</td>
+                    <td class="text-end">{{ subtitle and format_time(subtitle[1]) }}</td>
+                </tr>
+            {% endfor %}
+        {% else %}
+            <tr class="no-clips">
+                <td colspan="16" class="text-center text-muted p-4">No clips yet – create a script and press "Save &amp; Regenerate".</td>
+            </tr>
+        {% endif %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/clips.js') }}"></script>
+{% endblock %}

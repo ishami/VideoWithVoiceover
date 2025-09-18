@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Server Error{% endblock %}
+{% block content %}
+<div class="alert alert-danger">
+    <h4>Server Error</h4>
+    <p>An unexpected error occurred. Our team has been notified.</p>
+    {% if config.DEBUG %}
+    <p><strong>Error details:</strong> {{ error }}</p>
+    {% endif %}
+    <a href="{{ url_for('index') }}" class="btn btn-primary">Return to Home</a>
+</div>
+{% endblock %}

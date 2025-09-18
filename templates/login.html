@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Login</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f2f2f2;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 400px;
+      margin: 80px auto;
+      padding: 30px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+    }
+    h1 {
+      margin-bottom: 20px;
+      font-size: 24px;
+      color: #333;
+      text-align: center;
+    }
+    .flashes {
+      list-style: none;
+      padding: 0;
+      margin-bottom: 20px;
+    }
+    .flashes li {
+      padding: 10px;
+      border-radius: 4px;
+      margin-bottom: 10px;
+    }
+    .flashes li.error {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+    .flashes li.success {
+      background-color: #d4edda;
+      color: #155724;
+    }
+    form p {
+      margin-bottom: 15px;
+    }
+    label {
+      display: block;
+      font-weight: bold;
+      margin-bottom: 5px;
+      color: #555;
+    }
+    input[type="email"],
+    input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    .field-error {
+      color: #d9534f;
+      font-size: 0.9em;
+      margin-top: 4px;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background-color: #007bff;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .signup {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 0.95em;
+    }
+    .signup a {
+      color: #007bff;
+      text-decoration: none;
+    }
+    .signup a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Log In</h1>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <ul class="flashes">
+          {% for category, msg in messages %}
+            <li class="{{ category }}">{{ msg }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('login') }}">
+      {{ form.hidden_tag() }}
+
+      <p>
+        <label for="email">{{ form.email.label.text }}</label>
+        {{ form.email(id="email") }}
+        {% if form.email.errors %}
+          <div class="field-error">{{ form.email.errors[0] }}</div>
+        {% endif %}
+      </p>
+
+      <p>
+        <label for="password">{{ form.password.label.text }}</label>
+        {{ form.password(id="password") }}
+        {% if form.password.errors %}
+          <div class="field-error">{{ form.password.errors[0] }}</div>
+        {% endif %}
+      </p>
+
+      <p>
+        <button type="submit">Log In</button>
+      </p>
+    </form>
+
+    <p class="signup">
+      Don’t have an account?
+      <a href="{{ url_for('signup') }}">Sign up here</a>.
+    </p>
+  </div>
+</body>
+</html>

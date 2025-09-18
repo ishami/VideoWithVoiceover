@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Support{% endblock %}
+
+{% block content %}
+<div class="container my-4">
+    <h2>Support Ticket</h2>
+    <p>
+        Please check our
+        <a href="https://ai-videocreator.com/faq" target="_blank" rel="noopener">FAQ</a>
+        before submitting a support ticket.
+    </p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ 'danger' if category == 'error' else ('warning' if category == 'warning' else 'success') }} alert-dismissible fade show" role="alert">
+            {{ message }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" id="support-form" class="mt-3" autocomplete="off" novalidate>
+        <div class="mb-3">
+            <label for="customer_name" class="form-label">Name <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="customer_name" name="customer_name"
+                   value="{{ current_user.name if current_user.is_authenticated and current_user.name else (current_user.username if current_user.is_authenticated else '') }}" required>
+        </div>
+        <div class="mb-3">
+            <label for="customer_email" class="form-label">Email <span class="text-danger">*</span></label>
+            <input type="email" class="form-control" id="customer_email" name="customer_email"
+                   value="{{ current_user.email if current_user.is_authenticated else '' }}" required>
+        </div>
+        <div class="mb-3">
+            <label for="phone" class="form-label">Phone</label>
+            <input type="text" class="form-control" id="phone" name="phone">
+        </div>
+        <div class="mb-3">
+            <label for="ticket_type" class="form-label">Ticket Type <span class="text-danger">*</span></label>
+            <select class="form-select" id="ticket_type" name="ticket_type" required onchange="onTypeChange()">
+                {% for typ in ticket_types %}
+                  <option value="{{ typ|lower }}">{{ typ.title() }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <!-- Fields for "Issue" only -->
+        <div id="issue-fields">
+            <div class="mb-3">
+                <label for="issue_description" class="form-label">Issue Description <span class="text-danger">*</span></label>
+                <textarea class="form-control" id="issue_description" name="issue_description" rows="4"></textarea>
+            </div>
+            <div class="mb-3">
+                <label for="video_name" class="form-label">Video Name <span class="text-danger">*</span></label>
+                <input type="text" class="form-control" id="video_name" name="video_name">
+            </div>
+            <div class="mb-3">
+                <label for="creation_dt" class="form-label">Creation Date &amp; Time <span class="text-danger">*</span></label>
+                <input type="datetime-local" class="form-control" id="creation_dt" name="creation_dt"
+                    value="{{ current_time.strftime('%Y-%m-%dT%H:%M') if current_time and not sr_number else '' }}">
+            </div>
+        </div>
+
+        <!-- Field for "Enhancement" or "Comment" only -->
+        <div id="desc-field" style="display:none">
+            <div class="mb-3">
+                <label for="desc" class="form-label">Description <span class="text-danger">*</span></label>
+                <textarea class="form-control" id="desc" name="desc" rows="4"></textarea>
+            </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary">Submit Ticket</button>
+    </form>
+</div>
+
+<script>
+// Dynamic show/hide logic based on ticket type
+function onTypeChange() {
+    var typeSelect = document.getElementById('ticket_type');
+    var type = typeSelect.value.toLowerCase();
+    var issueFields = document.getElementById('issue-fields');
+    var descField = document.getElementById('desc-field');
+
+    if (type === 'issue') {
+        issueFields.style.display = '';
+        descField.style.display = 'none';
+
+        // Set required fields for "Issue"
+        document.getElementById('issue_description').required = true;
+        document.getElementById('video_name').required = true;
+        document.getElementById('creation_dt').required = true;
+        document.getElementById('desc').required = false;
+    } else {
+        issueFields.style.display = 'none';
+        descField.style.display = '';
+        // Set required fields for Enh/Comment
+        document.getElementById('issue_description').required = false;
+        document.getElementById('video_name').required = false;
+        document.getElementById('creation_dt').required = false;
+        document.getElementById('desc').required = true;
+    }
+}
+
+// Initial sync on page load
+document.addEventListener('DOMContentLoaded', function() {
+    onTypeChange();
+
+    // Optional: Client-side required field check on submit
+    document.getElementById('support-form').addEventListener('submit', function(e) {
+        var type = document.getElementById('ticket_type').value.toLowerCase();
+        var errors = [];
+        if (!this.customer_name.value.trim()) errors.push("Name is required");
+        if (!this.customer_email.value.trim()) errors.push("Email is required");
+        if (type === "issue") {
+            if (!this.issue_description.value.trim()) errors.push("Issue Description is required");
+            if (!this.video_name.value.trim()) errors.push("Video Name is required");
+            if (!this.creation_dt.value.trim()) errors.push("Creation Date & Time is required");
+        } else {
+            if (!this.desc.value.trim()) errors.push("Description is required");
+        }
+        if (errors.length > 0) {
+            alert("Please correct the following:\n\n" + errors.join("\n"));
+            e.preventDefault();
+        }
+    });
+});
+</script>
+{% endblock %}

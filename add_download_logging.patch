@@ -1,0 +1,51 @@
+--- engine.py.orig
++++ engine.py
+@@ -310,15 +310,20 @@ def _download_url_with_extension(url: str, dest_dir: Path, expected_type: str,
+     """
+     try:
++        print(f"[download] Attempting to download: {url}")
++        print(f"[download] Destination directory: {dest_dir}")
++        print(f"[download] Expected type: {expected_type}")
++        
+         # Ensure destination directory exists
+         dest_dir.mkdir(parents=True, exist_ok=True)
+         
+         # Download the content
+         response = requests.get(url, timeout=30, stream=True)
+         response.raise_for_status()
++        print(f"[download] Response status: {response.status_code}")
+         
+         # Try to determine extension from content-type
+         content_type = response.headers.get('Content-Type', '').lower()
++        print(f"[download] Content-Type: {content_type}")
+         
+         # Map content types to extensions
+         content_type_map = {
+@@ -349,6 +354,7 @@ def _download_url_with_extension(url: str, dest_dir: Path, expected_type: str,
+             parsed_url = urlparse(url)
+             url_filename = os.path.basename(parsed_url.path)
+             if '.' in url_filename:
+                 extension = os.path.splitext(url_filename)[1].lower()
++                print(f"[download] Extension from URL: {extension}")
+         
+         # Use a default extension based on expected type if still not found
+         if not extension:
+@@ -362,6 +368,7 @@ def _download_url_with_extension(url: str, dest_dir: Path, expected_type: str,
+             }
+             extension = type_defaults.get(expected_type, '.jpg')
++            print(f"[download] Using default extension: {extension}")
+         
+         # Create filename with proper extension
+         filename = f"{base_filename}{extension}"
+@@ -373,9 +380,11 @@ def _download_url_with_extension(url: str, dest_dir: Path, expected_type: str,
+                 for chunk in response.iter_content(chunk_size=8192):
+                     if chunk:
+                         f.write(chunk)
++            print(f"[download] Successfully saved to: {file_path}")
+             return file_path
+             
+     except Exception as e:
+         print(f"[download] Error downloading {url}: {str(e)}")
++        import traceback
++        traceback.print_exc()
+         return None

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/flags">
+    <file>flags/us.png</file>
+    <file>flags/sa.png</file>
+    <file>flags/es.png</file>
+    <file>flags/fr.png</file>
+    <file>flags/de.png</file>
+    <file>flags/pt.png</file>
+    <file>flags/ru.png</file>
+    <file>flags/cn.png</file>
+    <file>flags/jp.png</file>
+    <file>flags/in.png</file>
+    <file>flags/kr.png</file>
+    <file>flags/tr.png</file>
+    <file>flags/pk.png</file>
+    <file>flags/ir.png</file>
+  </qresource>
+</RCC>

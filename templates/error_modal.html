@@ -1,0 +1,258 @@
+<!-- templates/error_modal.html -->
+<div id="api-error-modal" class="modal fade" tabindex="-1" style="display: none;">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Service Temporarily Unavailable</h5>
+                <button type="button" class="btn-close" onclick="closeErrorModal()" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <span id="error-message">We're experiencing high demand. Your request will be processed with alternative methods.</span>
+                </div>
+                <div class="mb-3">
+                    <strong>What's happening?</strong>
+                    <ul class="mt-2">
+                        <li>Our primary AI service is temporarily unavailable</li>
+                        <li>We're automatically switching to backup services</li>
+                        <li>Your request will still be processed, though it may take a bit longer</li>
+                    </ul>
+                </div>
+                <div id="retry-info" class="alert alert-info" style="display: none;">
+                    <i class="fas fa-info-circle"></i>
+                    <span>Retrying automatically in <span id="retry-countdown">3</span> seconds...</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeErrorModal()">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="retryRequest()">
+                    <i class="fas fa-redo"></i> Try Again
+                </button>
+                <button type="button" class="btn btn-success" onclick="useAlternative()">
+                    <i class="fas fa-check"></i> Continue with Alternative
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Status indicator -->
+<div id="api-status-indicator" class="position-fixed" style="top: 20px; right: 20px; z-index: 1000; display: none;">
+    <div class="alert alert-warning alert-dismissible fade show">
+        <i class="fas fa-exclamation-triangle"></i>
+        <span id="status-message">API services experiencing issues</span>
+        <button type="button" class="btn-close" onclick="hideStatusIndicator()"></button>
+    </div>
+</div>
+
+<script>
+let retryFunction = null;
+let retryTimer = null;
+
+function handleAPIError(errorType, originalFunction, customMessage = null) {
+    const modal = document.getElementById('api-error-modal');
+    const message = document.getElementById('error-message');
+    const retryInfo = document.getElementById('retry-info');
+    const statusIndicator = document.getElementById('api-status-indicator');
+    const statusMessage = document.getElementById('status-message');
+
+    retryFunction = originalFunction;
+
+    const messages = {
+        'quota': 'OpenAI usage limit reached. Using alternative processing method.',
+        'rate_limit': 'Too many requests detected. Please wait a moment and try again.',
+        'network': 'Network connection issue. Retrying with backup service.',
+        'auth': 'Authentication issue detected. Please check your API credentials.',
+        'generic': 'Service temporarily unavailable. Please try again later.'
+    };
+
+    const errorMessage = customMessage || messages[errorType] || messages['generic'];
+    message.textContent = errorMessage;
+    statusMessage.textContent = errorMessage;
+    statusIndicator.style.display = 'block';
+    modal.style.display = 'block';
+    modal.classList.add('show');
+
+    if (errorType === 'rate_limit' || errorType === 'network') {
+        showAutoRetry();
+    }
+}
+
+function showAutoRetry() {
+    const retryInfo = document.getElementById('retry-info');
+    const countdown = document.getElementById('retry-countdown');
+    retryInfo.style.display = 'block';
+    let seconds = 3;
+    countdown.textContent = seconds;
+    retryTimer = setInterval(() => {
+        seconds--;
+        countdown.textContent = seconds;
+        if (seconds <= 0) {
+            clearInterval(retryTimer);
+            retryInfo.style.display = 'none';
+            closeErrorModal();
+            if (retryFunction) {
+                retryFunction();
+            }
+        }
+    }, 1000);
+}
+
+function retryRequest() {
+    closeErrorModal();
+    if (retryFunction) {
+        retryFunction();
+    }
+}
+
+function useAlternative() {
+    closeErrorModal();
+    showStatusMessage('Using alternative service...', 'info');
+    if (retryFunction) {
+        retryFunction();
+    }
+}
+
+function closeErrorModal() {
+    const modal = document.getElementById('api-error-modal');
+    const retryInfo = document.getElementById('retry-info');
+    modal.style.display = 'none';
+    modal.classList.remove('show');
+    retryInfo.style.display = 'none';
+    if (retryTimer) {
+        clearInterval(retryTimer);
+        retryTimer = null;
+    }
+}
+
+function hideStatusIndicator() {
+    const statusIndicator = document.getElementById('api-status-indicator');
+    statusIndicator.style.display = 'none';
+}
+
+function showStatusMessage(message, type = 'warning') {
+    const statusIndicator = document.getElementById('api-status-indicator');
+    const statusMessage = document.getElementById('status-message');
+    const alertDiv = statusIndicator.querySelector('.alert');
+    alertDiv.className = `alert alert-${type} alert-dismissible fade show`;
+    statusMessage.textContent = message;
+    statusIndicator.style.display = 'block';
+    if (type === 'success') {
+        setTimeout(() => {
+            hideStatusIndicator();
+        }, 3000);
+    }
+}
+
+// Fixed API Status Checking
+function checkAPIStatus() {
+    fetch('/api-status')
+        .then(response => response.json())
+        .then(data => {
+            console.log('API Status Response:', data);
+            
+            let issues = [];
+            
+            for (const [serviceName, serviceData] of Object.entries(data)) {
+                if (serviceName === 'last_updated') continue;
+                
+                if (typeof serviceData === 'object' && serviceData !== null) {
+                    if (serviceData.status !== 'operational') {
+                        issues.push(serviceName);
+                        console.log(`Service ${serviceName} issue:`, serviceData.message);
+                    }
+                }
+            }
+
+            if (issues.length > 0) {
+                const criticalIssues = issues.filter(service => 
+                    ['openai', 'huggingface'].includes(service.toLowerCase())
+                );
+                
+                if (criticalIssues.length > 0) {
+                    showStatusMessage(`Services with issues: ${criticalIssues.join(', ')}`, 'warning');
+                } else {
+                    hideStatusIndicator();
+                }
+            } else {
+                hideStatusIndicator();
+            }
+        })
+        .catch(error => {
+            console.warn('Failed to check API status:', error);
+        });
+}
+
+// Reduce frequency to avoid overwhelming the status checks
+setInterval(checkAPIStatus, 60000); // Every 60 seconds instead of 30
+
+document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(checkAPIStatus, 3000);
+});
+
+function handleFetchError(response, originalFunction) {
+    if (!response.ok) {
+        if (response.status === 429) {
+            handleAPIError('rate_limit', originalFunction);
+        } else if (response.status === 401 || response.status === 403) {
+            handleAPIError('auth', originalFunction);
+        } else if (response.status >= 500) {
+            handleAPIError('network', originalFunction);
+        } else {
+            handleAPIError('generic', originalFunction);
+        }
+        return true;
+    }
+    return false;
+}
+
+function safeFetch(url, options = {}, originalFunction = null) {
+    return fetch(url, options)
+        .then(response => {
+            if (handleFetchError(response, originalFunction)) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            return response;
+        })
+        .catch(error => {
+            console.error('Fetch error:', error);
+            if (originalFunction) {
+                if (error.message.includes('quota') || error.message.includes('429')) {
+                    handleAPIError('quota', originalFunction);
+                } else if (error.message.includes('rate limit')) {
+                    handleAPIError('rate_limit', originalFunction);
+                } else if (error.message.includes('network') || error.message.includes('Failed to fetch')) {
+                    handleAPIError('network', originalFunction);
+                } else {
+                    handleAPIError('generic', originalFunction);
+                }
+            }
+            throw error;
+        });
+}
+</script>
+
+<style>
+.modal {
+    background-color: rgba(0, 0, 0, 0.5);
+}
+.modal.show {
+    display: block !important;
+}
+#api-status-indicator {
+    max-width: 300px;
+}
+#api-status-indicator .alert {
+    margin: 0;
+    padding: 10px 15px;
+    font-size: 0.9em;
+}
+.btn-close {
+    background: none;
+    border: none;
+    font-size: 1.2em;
+    cursor: pointer;
+    padding: 5px;
+}
+</style>

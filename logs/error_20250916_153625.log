@@ -1,0 +1,22 @@
+[2025-09-16 15:36:34 +0000] [1167008] [INFO] Starting gunicorn 23.0.0
+[2025-09-16 15:36:34 +0000] [1167008] [INFO] Listening at: http://0.0.0.0:8000 (1167008)
+[2025-09-16 15:36:34 +0000] [1167008] [INFO] Using worker: sync
+[2025-09-16 15:36:34 +0000] [1167044] [INFO] Booting worker with pid: 1167044
+[2025-09-16 15:36:34 +0000] [1167045] [INFO] Booting worker with pid: 1167045
+[2025-09-16 15:36:34 +0000] [1167046] [INFO] Booting worker with pid: 1167046
+[2025-09-16 15:36:34 +0000] [1167047] [INFO] Booting worker with pid: 1167047
+[2025-09-16 15:37:01,663] INFO in app: Main tab form data: {'target_language': 'en', 'voice': 'en-US-AvaMultilingualNeural', 'platform': 'YouTube', 'genre': 'Soundtrack', 'modify_kw': 'yes', 'bypass': 'no', 'video_title': 'Singing Birds', 'script': 'Singing Birds', 'keywords': 'Singing Birds'}
+[2025-09-16 15:37:01,668] INFO in app: Reusing existing project 109
+[2025-09-16 15:37:01,671] INFO in app: Main tab form data: {'target_language': 'en', 'voice': 'en-US-AvaMultilingualNeural', 'platform': 'YouTube', 'genre': 'Soundtrack', 'modify_kw': 'yes', 'bypass': 'no', 'video_title': 'Singing Birds', 'script': 'Singing Birds', 'keywords': 'Singing Birds'}
+[2025-09-16 15:37:01,675] INFO in app: Reusing existing project 109
+[2025-09-16 15:37:04,680] INFO in app: Saved generated script for project 109
+[2025-09-16 15:37:05,834] INFO in app: Saved generated script for project 109
+[2025-09-16 15:37:31,088] INFO in app: [async_generate_clips] ✅ Downloads complete for project 109
+[2025-09-16 15:37:41,874] INFO in app: [/clips] Loaded clips.json for project 109
+[2025-09-16 15:37:51,380] INFO in app: [/clips] Loaded clips.json for project 109
+[2025-09-16 19:40:43 +0000] [1167044] [WARNING] Invalid request from ip=167.94.138.56: Invalid HTTP Version: (2, 0)
+[2025-09-16 19:41:15 +0000] [1167045] [WARNING] Invalid request from ip=167.94.138.56: Invalid HTTP Version: (2, 0)
+[2025-09-16 20:24:18 +0000] [1167047] [WARNING] Invalid request from ip=167.94.138.184: Invalid HTTP Version: (2, 0)
+[2025-09-16 20:24:22 +0000] [1167044] [WARNING] Invalid request from ip=167.94.138.184: Invalid HTTP Version: (2, 0)
+[2025-09-16 20:51:30 +0000] [1167046] [WARNING] Invalid request from ip=167.94.138.181: Invalid HTTP Version: (2, 0)
+[2025-09-16 20:51:34 +0000] [1167044] [WARNING] Invalid request from ip=167.94.138.181: Invalid HTTP Version: (2, 0)

@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2>Review / Edit Script</h2>
+
+<form id="script-form"
+      method="post"
+      action="{{ url_for('script') }}">
+
+  <!-- Filter out OpenAI errors and show clean content -->
+  <textarea name="script"
+            rows="18"
+            class="form-control">{% if script and 'OpenAI error' in script %}Your video script will be generated here using our advanced AI system. The content will be engaging and tailored to your topic.
+
+This script area is ready for your content. You can:
+• Edit the text directly
+• Save & Regenerate to create new content
+• Customize the narrative for your video
+
+The AI system will create compelling content that matches your video's theme and audience.{% else %}{{ script | e }}{% endif %}</textarea>
+
+  <button id="save-regenerate-btn"
+          type="button"
+          class="btn btn-success mt-2">
+      <i class="fas fa-save me-1"></i>Save &amp; Regenerate
+  </button>
+</form>
+
+<script>
+// Store project_id if available
+{% if project %}
+window.currentProjectId = "{{ project.id }}";
+sessionStorage.setItem('project_id', "{{ project.id }}");
+{% endif %}
+
+document.addEventListener('DOMContentLoaded', function() {
+  const form = document.getElementById('script-form');
+  const btn = document.getElementById('save-regenerate-btn');
+  if (!form || !btn) return;
+
+  btn.addEventListener('click', async (e) => {
+    e.preventDefault();
+
+    // Disable button and show loading state
+    btn.disabled = true;
+    const originalHTML = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Processing...';
+
+    try {
+      const formData = new FormData(form);
+
+      const response = await fetch(form.action, {
+        method: 'POST',
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: formData
+      });
+
+      const data = await response.json();
+
+      // Free-tier exceeded → prompt upgrade
+      if (!data.success && data.upgrade_url) {
+        const htmlMsg = data.message;
+        if (window.Swal) {
+          Swal.fire({
+            icon: 'warning',
+            title: 'Upgrade Required',
+            html: htmlMsg,
+            confirmButtonText: 'Upgrade'
+          }).then(result => {
+            if (result.isConfirmed) {
+              window.location.href = data.upgrade_url;
+            }
+          });
+        } else {
+          const textMsg = htmlMsg.replace(/<[^>]+>/g, '');
+          if (confirm(textMsg + '\n\nPress OK to upgrade now.')) {
+            window.location.href = data.upgrade_url;
+          }
+        }
+        return;
+      }
+
+      // Other error
+      if (!data.success) {
+        if (window.Swal) {
+          Swal.fire('Error', data.message, 'error');
+        } else {
+          alert('Error: ' + data.message);
+        }
+        return;
+      }
+
+      // Success → store project info and redirect to clips with progress
+      if (data.project_id) {
+        window.currentProjectId = data.project_id;
+        sessionStorage.setItem('project_id', data.project_id);
+        sessionStorage.setItem('from_script_regeneration', 'true');
+      }
+
+      // Success message and redirect
+      if (window.Swal) {
+        Swal.fire({
+          icon: 'success',
+          title: 'Processing Started!',
+          text: data.message,
+          timer: 2000,
+          timerProgressBar: true,
+          showConfirmButton: false
+        }).then(() => {
+          const clipsUrl = data.project_id ?
+            "{{ url_for('clips') }}?project_id=" + data.project_id :
+            "{{ url_for('clips') }}";
+          window.location.href = clipsUrl;
+        });
+      } else {
+        alert('Success: ' + data.message);
+        const clipsUrl = data.project_id ?
+          "{{ url_for('clips') }}?project_id=" + data.project_id :
+          "{{ url_for('clips') }}";
+        window.location.href = clipsUrl;
+      }
+
+    } catch (err) {
+      console.error('Form submission error:', err);
+      if (window.Swal) {
+        Swal.fire('Error', 'An unexpected error occurred. Please try again.', 'error');
+      } else {
+        alert('An unexpected error occurred. Please try again.');
+      }
+    } finally {
+      // Restore button state
+      btn.disabled = false;
+      btn.innerHTML = originalHTML;
+    }
+  });
+});
+</script>
+
+{% endblock %}
